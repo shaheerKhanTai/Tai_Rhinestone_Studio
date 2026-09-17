@@ -101,3 +101,71 @@ class TestDensityParamsFromSettings:
     def test_invert_flag(self):
         p = density_params_from_settings(GenerationSettings(), invert=True)
         assert p.invert is True
+
+
+class TestTraceMaskGating:
+    """The trace mask strictly restricts where stones may land."""
+
+    @staticmethod
+    def _left_half_mask(w_mm=100.0, h_mm=100.0):
+        from app.core.trace_mask import blank_mask, paint_stroke
+
+        m = blank_mask(w_mm, h_mm)
+        # A thick vertical band over the left 40% of the artboard.
+        paint_stroke(m, (20.0, h_mm / 2), (20.0, h_mm / 2), 20.0, w_mm, h_mm)
+        return m
+
+    def test_stones_strictly_inside_mask(self):
+        from app.core.trace_mask import blank_mask, paint_stroke, mask_shape_for
+
+        mask = self._left_half_mask()
+        result = generate(
+            disc_image(), GenerationSettings(), 100.0, 100.0, trace_mask=mask
+        )
+        assert result.stone_count > 20  # the band itself is filled
+        pos = result.placement.positions_mm
+        # Map every stone centre back onto the mask raster: it must be painted.
+        mh, mw = mask.shape
+        ix = np.clip(np.round(pos[:, 0] / 100.0 * (mw - 1)).astype(int), 0, mw - 1)
+        iy = np.clip(np.round(pos[:, 1] / 100.0 * (mh - 1)).astype(int), 0, mh - 1)
+        assert bool(np.all(mask[iy, ix] == 255))  # strict — nothing outside
+
+    def test_shading_still_applies_inside_mask(self):
+        # Inside the traced band, a dark sub-region gets more stones than a
+        # light one — the trace gates placement, the image drives density.
+        from app.core.trace_mask import blank_mask, paint_stroke
+
+        rgba = np.full((300, 300, 4), 255, np.uint8)
+        rgba[:, :150, :3] = 30   # dark left half
+        rgba[:, 150:, :3] = 210  # light right half
+        mask = blank_mask(100.0, 100.0)
+        paint_stroke(mask, (50.0, 50.0), (50.0, 50.0), 49.0, 100.0, 100.0)  # whole board
+        result = generate(rgba, GenerationSettings(), 100.0, 100.0, trace_mask=mask)
+        pos = result.placement.positions_mm
+        dark = int(np.sum(pos[:, 0] < 50.0))
+        light = int(np.sum(pos[:, 0] >= 50.0))
+        assert dark > light * 3
+
+    def test_empty_mask_yields_nothing(self):
+        from app.core.trace_mask import blank_mask
+
+        result = generate(
+            disc_image(), GenerationSettings(), 100.0, 100.0,
+            trace_mask=blank_mask(100.0, 100.0),
+        )
+        assert result.stone_count == 0
+
+    def test_mask_with_organic_mode(self):
+        mask = self._left_half_mask()
+        s = GenerationSettings(placement_mode=PlacementMode.ORGANIC)
+        result = generate(disc_image(), s, 100.0, 100.0, trace_mask=mask)
+        assert result.stone_count > 10
+        assert float(np.mean(result.placement.positions_mm[:, 0] < 40.0)) > 0.99
+
+    def test_no_mask_unchanged(self):
+        # Omitting the mask must behave exactly like the pre-trace pipeline.
+        a = generate(disc_image(), GenerationSettings(), 100.0, 100.0)
+        b = generate(disc_image(), GenerationSettings(), 100.0, 100.0, trace_mask=None)
+        np.testing.assert_array_equal(
+            a.placement.positions_mm, b.placement.positions_mm
+        )

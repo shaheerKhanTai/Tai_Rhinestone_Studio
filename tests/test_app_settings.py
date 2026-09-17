@@ -37,12 +37,14 @@ class TestAppSettings:
         assert s.analysis_max_dim >= 400
 
     def test_roundtrip(self):
-        s = AppSettings(theme="light", default_units=Unit.MM, background_opacity=70)
+        s = AppSettings(theme="light", default_units=Unit.MM, background_opacity=70,
+                        wheel_zooms=True)
         s.add_recent_project("x.rhinestone")
         restored = AppSettings.from_dict(s.to_dict())
         assert restored.theme == "light"
         assert restored.default_units is Unit.MM
         assert restored.background_opacity == 70
+        assert restored.wheel_zooms is True
         assert restored.recent_projects == ["x.rhinestone"]
 
     def test_from_dict_tolerates_bad_unit(self):

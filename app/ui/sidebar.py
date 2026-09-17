@@ -78,6 +78,9 @@ class DesignPanel(QWidget):
         self._image_name.setWordWrap(True)
         self._image_info = QLabel("")
         self._image_info.setProperty("role", "caption")
+        # Wrap so a long "WxHpx · FORMAT · N KB" line can never widen the
+        # panel past its dock — different resolutions must not stretch the UI.
+        self._image_info.setWordWrap(True)
         import_btn = QPushButton("Import Image…")
         import_btn.clicked.connect(self.import_image_requested)
         lay.addWidget(self._image_name)
@@ -111,12 +114,26 @@ class DesignPanel(QWidget):
             self._transform_layout.addWidget(btn)
         self._transform_layout.addStretch(1)
 
+    @staticmethod
+    def _make_combo() -> NoWheelComboBox:
+        """A combo that elides long items instead of widening the panel.
+
+        Left to its default size policy a combo's hint is the *widest* item,
+        so long preset names ("T-Shirt Front — 11 × 12 in") forced the sidebar
+        past its dock width and clipped it. Capped to a reasonable content
+        length, long text is ellipsised and the panel stays at dock width.
+        """
+        combo = NoWheelComboBox()
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(10)
+        return combo
+
     def _build_size_group(self) -> QWidget:
         box = QGroupBox("2 · Design Size")
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
 
-        self._preset_combo = NoWheelComboBox()
+        self._preset_combo = self._make_combo()
         for preset in self._presets:
             self._preset_combo.addItem(preset.name, preset)
         self._preset_combo.currentIndexChanged.connect(self._on_preset_selected)
@@ -129,7 +146,7 @@ class DesignPanel(QWidget):
         form.addRow("Width", self._width_spin)
         form.addRow("Height", self._height_spin)
 
-        self._unit_combo = NoWheelComboBox()
+        self._unit_combo = self._make_combo()
         for unit, label in _UNIT_ITEMS:
             self._unit_combo.addItem(label, unit)
         self._unit_combo.currentIndexChanged.connect(self._on_unit_changed)
@@ -154,7 +171,7 @@ class DesignPanel(QWidget):
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
 
-        self._size_combo = NoWheelComboBox()
+        self._size_combo = self._make_combo()
         for name in STONE_SIZE_ORDER:
             d = get_stone_size(name).diameter_mm
             self._size_combo.addItem(f"{name}  ·  {d:.1f} mm", name)
@@ -182,8 +199,9 @@ class DesignPanel(QWidget):
         form.addRow("Spacing (gap)", self._spacing)
 
         self._pitch_label = QLabel("—")
+        self._pitch_label.setToolTip("Distance between neighbouring stone centres")
         self._pitch_label.setProperty("role", "caption")
-        form.addRow("Center-to-center", self._pitch_label)
+        form.addRow("Pitch", self._pitch_label)
 
         self._push_all = QCheckBox("Push All")
         self._push_all.setToolTip(
@@ -193,10 +211,12 @@ class DesignPanel(QWidget):
         self._push_all.toggled.connect(lambda _: self._emit_settings())
         form.addRow("", self._push_all)
 
-        self._mode_combo = NoWheelComboBox()
+        self._mode_combo = self._make_combo()
         for mode in PlacementMode:
             self._mode_combo.addItem(mode.label, mode)
-        self._mode_combo.setCurrentIndex(2)  # hexagonal
+        # Default follows the settings model (Outline + Fill) — selected by
+        # data, never by index, so enum order can change freely.
+        self._set_combo_data(self._mode_combo, GenerationSettings().placement_mode)
         self._mode_combo.currentIndexChanged.connect(lambda _: self._emit_settings())
         form.addRow("Placement", self._mode_combo)
         return box
@@ -215,9 +235,23 @@ class DesignPanel(QWidget):
             s.valueCommitted.connect(lambda _=0.0: self._emit_settings())
             lay.addWidget(s)
 
-        self._invert = QCheckBox("Light subject on dark background")
+        self._invert = QCheckBox("Light subject on\ndark background")
+        self._invert.setToolTip(
+            "Place stones on the light parts of the image instead of the "
+            "dark parts (e.g. white lettering on a black shirt)."
+        )
         self._invert.toggled.connect(lambda _: self._emit_settings())
         lay.addWidget(self._invert)
+
+        self._invert_areas = QCheckBox("Invert Rhinestone Areas")
+        self._invert_areas.setToolTip(
+            "Fill the empty parts of the design instead of the subject — the "
+            "pattern shifts into the complementary regions of the same area.\n"
+            "The stone size, spacing and margins are unchanged; transparent "
+            "areas stay empty."
+        )
+        self._invert_areas.toggled.connect(lambda _: self._emit_settings())
+        lay.addWidget(self._invert_areas)
 
         # Max stone count with an unlimited toggle.
         limit_row = QHBoxLayout()
@@ -300,6 +334,8 @@ class DesignPanel(QWidget):
             self._contrast.set_value(s.contrast)
             self._smoothing.set_value(s.smoothing)
             self._edge.set_value(s.edge_preservation)
+            self._invert.setChecked(s.invert_tone)
+            self._invert_areas.setChecked(s.invert_areas)
             enabled = s.max_stones is not None
             self._limit_enabled.setChecked(enabled)
             self._max_stones.setEnabled(enabled)
@@ -424,6 +460,8 @@ class DesignPanel(QWidget):
             contrast=self._contrast.value(),
             smoothing=self._smoothing.value(),
             edge_preservation=self._edge.value(),
+            invert_tone=self._invert.isChecked(),
+            invert_areas=self._invert_areas.isChecked(),
             max_stones=self._max_stones.value() if self._limit_enabled.isChecked() else None,
         )
 

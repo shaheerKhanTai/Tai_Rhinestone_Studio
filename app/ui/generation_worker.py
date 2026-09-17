@@ -39,9 +39,10 @@ class GenerationWorker(QRunnable):
         width_mm: float,
         height_mm: float,
         *,
-        invert: bool = False,
+        invert: bool | None = None,
         color: str = "#1F2933",
         analysis_max_dim: int = 1400,
+        trace_mask: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self.signals = GenerationSignals()
@@ -49,9 +50,15 @@ class GenerationWorker(QRunnable):
         self._settings = settings.copy()
         self._width_mm = width_mm
         self._height_mm = height_mm
+        # None → the settings' own tone polarity decides (the normal path).
         self._invert = invert
         self._color = color
         self._analysis_max_dim = analysis_max_dim
+        # The project's mask is painted in place on the GUI thread — snapshot
+        # it so the worker's copy is stable for the whole run.
+        self._trace_mask = (
+            np.array(trace_mask, copy=True) if trace_mask is not None else None
+        )
         self._cancel = False
 
     def cancel(self) -> None:
@@ -78,6 +85,7 @@ class GenerationWorker(QRunnable):
                 invert=self._invert,
                 color=self._color,
                 analysis_max_dim=self._analysis_max_dim,
+                trace_mask=self._trace_mask,
                 progress=self.signals.progress.emit,
                 is_cancelled=self._is_cancelled,
                 on_batch=_on_batch,

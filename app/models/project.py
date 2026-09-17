@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 from app import PROJECT_FORMAT_VERSION, __version__
 from app.core.geometry import GeometryError, Unit, from_mm
 from app.models.design import Design
@@ -84,6 +86,10 @@ class Project:
     lock_aspect: bool = True
     settings: GenerationSettings = field(default_factory=GenerationSettings)
     design: Design = field(default_factory=lambda: Design(254.0, 203.2))
+    #: Trace-tool region mask (design-mm space, uint8 0/255, or None). Gates
+    #: generation when present. Serialized as a PNG member by the project
+    #: service — ``to_dict`` only records whether it exists.
+    trace_mask: np.ndarray | None = None
     app_version: str = __version__
     metadata: dict = field(default_factory=dict)
 
@@ -137,6 +143,7 @@ class Project:
             "lock_aspect": self.lock_aspect,
             "settings": self.settings.to_dict(),
             "design": self.design.to_dict(),
+            "has_trace": self.trace_mask is not None,
             "metadata": self.metadata,
         }
 

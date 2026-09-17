@@ -33,10 +33,23 @@ from PySide6.QtGui import (
     QPixmap,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QGridLayout, QScrollBar, QWidget
 
 from app.core.geometry import Unit
-from app.core.history import AddStonesCommand, Command, DeleteStonesCommand, MoveStonesCommand
+from app.core.history import (
+    AddStonesCommand,
+    Command,
+    DeleteStonesCommand,
+    MoveStonesCommand,
+    PaintTraceCommand,
+    SetTraceMaskCommand,
+)
+from app.core.trace_mask import (
+    blank_mask,
+    paint_stroke as paint_mask_stroke,
+    resample_mask,
+    stroke_bbox,
+)
 from app.models.design import Design
 from app.models.stone import DEFAULT_STONE_COLOR, Stone
 from app.ui.qt_image import numpy_rgba_to_qimage
@@ -46,6 +59,8 @@ from app.ui.theme import Theme
 _MIN_ZOOM = 0.05
 _MAX_ZOOM = 80.0
 _RULER = 20  # ruler strip thickness (px)
+#: Screen pixels scrolled per wheel notch (120 units of ``angleDelta``).
+_WHEEL_STEP_PX = 60.0
 
 #: The artboard ("paper") colour — a near-white used in both themes so stones
 #: read with strong contrast against the document surface.
@@ -64,6 +79,7 @@ class CanvasTool(enum.Enum):
     BRUSH = "brush"
     ERASER = "eraser"
     CROP = "crop"
+    TRACE = "trace"
 
 
 def _as_point(mm: QPointF):
@@ -83,16 +99,26 @@ class CanvasView(QWidget):
     crop_committed = Signal(float, float, float, float)  # normalized x, y, w, h of the artboard
     crop_cancelled = Signal()
     push_failed = Signal()                # Push All could not resolve the move
+    trace_changed = Signal()              # trace mask painted / erased / cleared
+    trace_mask_replaced = Signal()        # mask array identity changed (undo/clear)
 
     def __init__(self, theme: Theme, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._theme = theme
         self._design: Design | None = None
         self._unit = Unit.INCH
+        # Owning project (for the trace mask); set by the main window.
+        self._project = None
 
         # View transform: screen = origin + mm * zoom.
         self._zoom = 1.0
         self._origin = QPointF(0.0, 0.0)
+
+        # Scrollbars: attached by CanvasScrollHost, the canvas owns the model.
+        self._hbar: QScrollBar | None = None
+        self._vbar: QScrollBar | None = None
+        self._syncing_bars = False
+        self._wheel_zooms = False  # Preferences: plain wheel zooms (pre-scrollbars)
 
         # Cached stone geometry (rebuilt on set_design / refresh_geometry).
         self._pos = np.empty((0, 2), dtype=np.float64)
@@ -147,6 +173,16 @@ class CanvasView(QWidget):
         self._push_snapshot: np.ndarray | None = None  # pre-drag positions (N, 2)
         self._push_failed = False
 
+        # Trace tool state: the mask belongs to the project; the canvas holds
+        # a live reference for painting and renders it as an overlay.
+        self._trace_mask: np.ndarray | None = None
+        self._trace_pixmap: QPixmap | None = None   # overlay cache (mask → px)
+        self._trace_stroke_before: np.ndarray | None = None  # snapshot at press
+        self._trace_last_mm: QPointF | None = None
+        self._trace_erasing = False
+        self._trace_changed = False
+        self._trace_hover_mm: QPointF | None = None
+
         # AI suggestion preview (Issue 6): ghost stones for proposed adds and
         # arrows for proposed moves, drawn above everything else.
         self._ai_preview_adds: np.ndarray = np.empty((0, 2), dtype=np.float64)
@@ -176,6 +212,7 @@ class CanvasView(QWidget):
         if design is not None and fit:
             self.fit_to_view()
         self.update()
+        self._sync_scrollbars()
 
     def set_background_image(self, rgba: np.ndarray | None) -> None:
         """Set the source-image overlay (or ``None`` to clear)."""
@@ -268,6 +305,182 @@ class CanvasView(QWidget):
     def set_push_all(self, enabled: bool) -> None:
         """Enable/disable Push All for stone drags (from generation settings)."""
         self._push_all = bool(enabled)
+
+    # ------------------------------------------------------------------ #
+    # Trace tool — paint the regions generation should fill
+    # ------------------------------------------------------------------ #
+    def set_project(self, project) -> None:
+        """Remember the owning project (the trace mask lives on it)."""
+        self._project = project
+
+    def set_trace_mask(self, mask: np.ndarray | None) -> None:
+        """Bind the project's trace mask (no copy) for painting/display."""
+        self._trace_mask = mask
+        self._trace_pixmap = None
+        self.update()
+
+    def trace_mask(self) -> np.ndarray | None:
+        return self._trace_mask
+
+    def has_trace(self) -> bool:
+        return self._trace_mask is not None and bool(np.any(self._trace_mask))
+
+    def clear_trace(self) -> None:
+        """Remove the whole traced area (undoable)."""
+        command = self.clear_trace_command()
+        if command is not None:
+            self.command_produced.emit(command)
+
+    def clear_trace_command(self, *, label: str = "Clear trace") -> Command | None:
+        """Clear the traced area and return the undoable command, unrecorded.
+
+        The *caller* owns the returned command so an operation that consumes the
+        trace can group the clear with its own step (generation does this, so a
+        single Ctrl+Z restores both the previous design and the traced area).
+        Returns ``None`` when nothing was traced, or when the canvas has no
+        project to swap the mask on.
+
+        The overlay and the project's mask are cleared immediately and
+        ``trace_changed`` fires as for any other trace edit, so the UI stays
+        consistent without the command being applied.
+        """
+        if self._project is None or not self.has_trace():
+            return None
+        before = self._trace_mask
+        self._trace_mask = None
+        self._project.trace_mask = None
+        self._trace_pixmap = None
+        command = SetTraceMaskCommand(
+            self._project, before, None, on_change=self._on_trace_swapped, label=label
+        )
+        self.trace_mask_replaced.emit()
+        self.trace_changed.emit()
+        self.update()
+        return command
+
+    def resync_trace_to_project(self) -> None:
+        """Re-bind the mask after undo/redo or a project-level swap."""
+        mask = getattr(self._project, "trace_mask", None) if self._project is not None else None
+        self.set_trace_mask(mask)
+
+    def resample_trace_to(self, width_mm: float, height_mm: float) -> None:
+        """Adopt the mask to a changed design aspect (keeps relative position)."""
+        if self._trace_mask is None:
+            return
+        resampled = resample_mask(self._trace_mask, width_mm, height_mm)
+        if resampled is not self._trace_mask and self._project is not None:
+            self._project.trace_mask = resampled
+        self.set_trace_mask(resampled)
+
+    def _on_trace_swapped(self) -> None:
+        """History callback: a command swapped the mask — refresh and notify."""
+        self._trace_pixmap = None
+        self.resync_trace_to_project()
+        self.trace_mask_replaced.emit()
+        self.trace_changed.emit()
+        self.update()
+
+    def _begin_trace(self, mm: QPointF, erase: bool) -> None:
+        if self._design is None:
+            return
+        if self._trace_mask is None:
+            self._trace_mask = blank_mask(self._design.width_mm, self._design.height_mm)
+            if self._project is not None:
+                self._project.trace_mask = self._trace_mask
+            # No mask existed before this stroke: record it as the None→mask
+            # transition so a single undo removes the mask entirely.
+            self._trace_stroke_before = None
+        else:
+            self._trace_stroke_before = self._trace_mask.copy()
+        self._trace_last_mm = QPointF(mm)
+        self._trace_erasing = erase
+        self._trace_changed = False
+        self._apply_trace(mm)
+
+    def _apply_trace(self, mm: QPointF) -> None:
+        if self._design is None or self._trace_mask is None or self._trace_last_mm is None:
+            return
+        changed = paint_mask_stroke(
+            self._trace_mask,
+            (self._trace_last_mm.x(), self._trace_last_mm.y()),
+            (mm.x(), mm.y()),
+            self._brush_radius_mm,
+            self._design.width_mm,
+            self._design.height_mm,
+            erase=self._trace_erasing,
+        )
+        self._trace_changed = self._trace_changed or changed
+        self._trace_last_mm = QPointF(mm)
+        self._trace_pixmap = None  # rebuild overlay from the mutated mask
+        self.update()
+
+    def _end_trace(self) -> None:
+        before = self._trace_stroke_before
+        self._trace_stroke_before = None
+        self._trace_last_mm = None
+        mask = self._trace_mask
+        if not self._trace_changed or mask is None or self._design is None:
+            # Nothing painted: drop a freshly-created empty mask.
+            if mask is not None and not np.any(mask):
+                self._trace_mask = None
+                if self._project is not None:
+                    self._project.trace_mask = None
+                self._trace_pixmap = None
+                self.update()
+            return
+        bbox = stroke_bbox(mask, before)
+        label = "Erase trace" if self._trace_erasing else "Trace area"
+        if before is None or bbox is None:
+            # First-ever stroke (mask was just created) — swap None ↔ mask.
+            cmd = SetTraceMaskCommand(
+                self._project, None, mask,
+                on_change=self._on_trace_swapped, label=label,
+            )
+        else:
+            cmd = PaintTraceCommand(
+                self._project, before, bbox,
+                on_change=self._trace_overlay_invalidated, label=label,
+            )
+        self.command_produced.emit(cmd)
+        self.trace_changed.emit()
+
+    def _trace_overlay_invalidated(self) -> None:
+        """History callback: patches were swapped in place — refresh overlay."""
+        self._trace_pixmap = None
+        self.update()
+
+    def _paint_trace_overlay(self, painter: QPainter, art: QRectF) -> None:
+        if self._trace_mask is None or not np.any(self._trace_mask):
+            return
+        if self._trace_pixmap is None:
+            h, w = self._trace_mask.shape
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            color = QColor(self._theme.palette.primary)
+            rgba[:, :, 0] = color.red()
+            rgba[:, :, 1] = color.green()
+            rgba[:, :, 2] = color.blue()
+            rgba[:, :, 3] = self._trace_mask  # painted pixels opaque-ish
+            self._trace_pixmap = QPixmap.fromImage(numpy_rgba_to_qimage(rgba))
+        painter.save()
+        painter.setClipRect(art)
+        painter.setOpacity(0.35)
+        painter.drawPixmap(art.toRect(), self._trace_pixmap)
+        painter.restore()
+
+    def _paint_trace_cursor(self, painter: QPainter) -> None:
+        """Brush-radius circle preview while the Trace tool is active."""
+        if self._tool is not CanvasTool.TRACE or self._trace_hover_mm is None:
+            return
+        c = self.mm_to_screen(self._trace_hover_mm.x(), self._trace_hover_mm.y())
+        r = self._brush_radius_mm * self._zoom
+        pal = self._theme.palette
+        pen = QPen(QColor(pal.primary))
+        pen.setStyle(Qt.DashLine)
+        pen.setWidthF(1.2)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(c, r, r)
 
     # ------------------------------------------------------------------ #
     # Progressive generation streaming (ISSUE 5)
@@ -475,6 +688,12 @@ class CanvasView(QWidget):
             return self._design.width_mm, self._design.height_mm
         return 254.0, 203.2
 
+    def _fitted_origin(self) -> QPointF:
+        """Origin that centres the artboard — the position ``fit_to_view`` uses."""
+        w_mm, h_mm = self._design_size_mm()
+        return QPointF((self.width() + _RULER) / 2 - (w_mm * self._zoom) / 2,
+                       (self.height() + _RULER) / 2 - (h_mm * self._zoom) / 2)
+
     def fit_to_view(self) -> None:
         w_mm, h_mm = self._design_size_mm()
         avail_w = max(50, self.width() - 2 * _RULER - 48)
@@ -482,11 +701,10 @@ class CanvasView(QWidget):
         zoom = min(avail_w / w_mm, avail_h / h_mm)
         self._set_zoom(zoom)
         # Centre the artboard.
-        cx = (self.width() + _RULER) / 2 - (w_mm * self._zoom) / 2
-        cy = (self.height() + _RULER) / 2 - (h_mm * self._zoom) / 2
-        self._origin = QPointF(cx, cy)
+        self._origin = self._fitted_origin()
         self._emit_zoom()
         self.update()
+        self._sync_scrollbars()
 
     def actual_size(self) -> None:
         center = self.screen_to_mm(self.width() / 2, self.height() / 2)
@@ -509,16 +727,130 @@ class CanvasView(QWidget):
         self._set_zoom(self._zoom * factor)
         after = self.mm_to_screen(before.x(), before.y())
         self._origin += screen_pt - after
+        # Zooming out near an edge slides the artboard back into reach instead
+        # of leaving the user staring at empty canvas (as Photoshop does).
+        self._clamp_origin()
         self._emit_zoom()
         self.update()
+        self._sync_scrollbars()
 
     def _center_on_mm(self, mm: QPointF) -> None:
         target = QPointF(self.width() / 2, self.height() / 2)
         cur = self.mm_to_screen(mm.x(), mm.y())
         self._origin += target - cur
+        self._clamp_origin()
+        self._sync_scrollbars()
 
     def _emit_zoom(self) -> None:
         self.zoom_changed.emit(self._zoom / self._actual_zoom() * 100.0)
+
+    # ------------------------------------------------------------------ #
+    # Scrolling (Photoshop-style rails + touchpad panning)
+    # ------------------------------------------------------------------ #
+    def attach_scrollbars(self, hbar: QScrollBar, vbar: QScrollBar) -> None:
+        """Bind the rails supplied by :class:`CanvasScrollHost`."""
+        self._hbar, self._vbar = hbar, vbar
+        hbar.valueChanged.connect(lambda _value: self._on_scrollbar())
+        vbar.valueChanged.connect(lambda _value: self._on_scrollbar())
+        self._sync_scrollbars()
+
+    def set_wheel_zooms(self, on: bool) -> None:
+        """Preferences: plain wheel zooms instead of scrolling the view."""
+        self._wheel_zooms = bool(on)
+
+    def _pan_bounds(self) -> tuple[float, float, float, float]:
+        """Allowed origin box ``(min_x, max_x, min_y, max_y)`` in screen px.
+
+        Photoshop's canvas slack: the artboard may be panned until either of its
+        edges reaches the viewport centre — never entirely out of sight. The
+        fitted (centred) position is always inside the box, so ``fit_to_view``
+        and the clamped view agree.
+        """
+        w_mm, h_mm = self._design_size_mm()
+        cw, ch = w_mm * self._zoom, h_mm * self._zoom
+        fit = self._fitted_origin()
+        vw, vh = float(self.width()), float(self.height())
+        return (min(vw / 2 - cw, fit.x()), max(vw / 2, fit.x()),
+                min(vh / 2 - ch, fit.y()), max(vh / 2, fit.y()))
+
+    def _clamp_origin(self) -> None:
+        """Keep the artboard within panning reach (no-op before a design exists)."""
+        if self._design is None or self.width() <= 0 or self.height() <= 0:
+            return
+        lo_x, hi_x, lo_y, hi_y = self._pan_bounds()
+        self._origin = QPointF(min(max(self._origin.x(), lo_x), hi_x),
+                               min(max(self._origin.y(), lo_y), hi_y))
+
+    def _scrollable(self) -> bool:
+        return self._design is not None and self.width() > 0 and self.height() > 0
+
+    def _sync_scrollbars(self) -> None:
+        """Push the current zoom/pan into the rails (range, page step, position).
+
+        The rail spans one document plus one viewport, the standard mapping: the
+        value counts pixels scrolled from "artboard centred left" (0) to
+        "centred right" (content px), with ``pageStep = viewport``. When the
+        whole design fits, the range collapses to 0 so the handle fills the rail
+        — Photoshop's "nothing to scroll" look.
+        """
+        if self._hbar is None or self._vbar is None or self._syncing_bars:
+            return
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        w_mm, h_mm = self._design_size_mm()
+        self._syncing_bars = True
+        try:
+            for bar, content_mm, view, origin in (
+                (self._hbar, w_mm, float(self.width()), self._origin.x()),
+                (self._vbar, h_mm, float(self.height()), self._origin.y()),
+            ):
+                bar.setPageStep(max(1, int(view)))
+                bar.setSingleStep(max(16, int(view / 10)))
+                content = content_mm * self._zoom
+                if self._scrollable() and content > view:
+                    bar.setRange(0, int(round(content)))
+                    bar.setValue(int(round(view / 2.0 - origin)))
+                else:
+                    bar.setRange(0, 0)
+        finally:
+            self._syncing_bars = False
+
+    def _on_scrollbar(self) -> None:
+        """A rail moved: adopt it as the new pan position."""
+        if self._hbar is None or self._vbar is None or self._syncing_bars:
+            return
+        _lo_x, hi_x, _lo_y, hi_y = self._pan_bounds()
+        self._origin = QPointF(hi_x - self._hbar.value(), hi_y - self._vbar.value())
+        self._clamp_origin()
+        self.update()
+        self._sync_scrollbars()
+
+    def scroll_by_pixels(self, dx: float, dy: float) -> None:
+        """Pan by a scroll delta in screen px — the content follows the gesture."""
+        if not dx and not dy:
+            return
+        self._origin = QPointF(self._origin.x() + dx, self._origin.y() + dy)
+        self._clamp_origin()
+        self.update()
+        self._sync_scrollbars()
+
+    @staticmethod
+    def _wheel_delta_px(event: QWheelEvent) -> tuple[float, float]:
+        """Wheel/touchpad delta in screen px, content-follows-gesture sign.
+
+        Touchpads report ``pixelDelta`` (smooth, two axes); a mouse notch only
+        reports ``angleDelta``, which we scale to :data:`_WHEEL_STEP_PX`.
+        """
+        pixel = event.pixelDelta()
+        if not pixel.isNull():
+            dx, dy = float(pixel.x()), float(pixel.y())
+        else:
+            angle = event.angleDelta()
+            dx = angle.x() / 120.0 * _WHEEL_STEP_PX
+            dy = angle.y() / 120.0 * _WHEEL_STEP_PX
+        if event.modifiers() & Qt.ShiftModifier and not dx:
+            dx, dy = dy, 0.0  # Shift+wheel scrolls sideways, as in Photoshop.
+        return dx, dy
 
     # ------------------------------------------------------------------ #
     # Selection
@@ -658,8 +990,10 @@ class CanvasView(QWidget):
         if self._show_grid:
             self._paint_grid(painter, art, w_mm, h_mm)
 
+        self._paint_trace_overlay(painter, art)
         self._paint_stones(painter, art)
         self._paint_rubber_band(painter)
+        self._paint_trace_cursor(painter)
         self._paint_ai_preview(painter)
         if self._crop_mode:
             self._paint_crop_overlay(painter, art)
@@ -940,7 +1274,7 @@ class CanvasView(QWidget):
     def _update_cursor(self) -> None:
         if self._space_down or self._tool is CanvasTool.PAN:
             self.setCursor(Qt.OpenHandCursor)
-        elif self._tool in (CanvasTool.ADD, CanvasTool.BRUSH, CanvasTool.CROP):
+        elif self._tool in (CanvasTool.ADD, CanvasTool.BRUSH, CanvasTool.CROP, CanvasTool.TRACE):
             self.setCursor(Qt.CrossCursor)
         elif self._tool in (CanvasTool.DELETE, CanvasTool.ERASER):
             self.setCursor(Qt.PointingHandCursor)
@@ -948,11 +1282,20 @@ class CanvasView(QWidget):
             self.setCursor(Qt.ArrowCursor)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
-        delta = event.angleDelta().y()
-        if delta == 0:
+        # Photoshop convention: scrolling pans the canvas, Ctrl/Alt+scroll zooms
+        # about the cursor. A laptop touchpad's two-finger scroll reaches us as
+        # the same event as a wheel, so this is the only way both gestures can
+        # coexist — the preference flips it back for wheel-zoom muscle memory.
+        if self._wheel_zooms or event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
+            delta = event.angleDelta().y()
+            if delta == 0:
+                return
+            self._zoom_about(event.position(), 1.0015 ** delta)
             return
-        factor = 1.0015 ** delta
-        self._zoom_about(event.position(), factor)
+        dx, dy = self._wheel_delta_px(event)
+        if dx or dy:
+            self.scroll_by_pixels(dx, dy)
+        event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         pos = event.position()
@@ -965,6 +1308,9 @@ class CanvasView(QWidget):
             self.setCursor(Qt.ClosedHandCursor)
             return
         if event.button() != Qt.LeftButton:
+            # The Trace tool's erase stroke rides on the right button.
+            if event.button() == Qt.RightButton and self._tool is CanvasTool.TRACE:
+                self._begin_trace(mm, erase=True)
             return
 
         tool = self._tool
@@ -985,6 +1331,9 @@ class CanvasView(QWidget):
             self._begin_brush(tool)
             self._apply_brush(mm, tool)
             return
+        if tool is CanvasTool.TRACE:
+            self._begin_trace(mm, erase=False)
+            return
         # SELECT: either start dragging a hit stone, or begin a rubber band.
         idx = self._hit_test(mm)
         if idx is not None and self._selected.size and self._selected[idx]:
@@ -1001,15 +1350,22 @@ class CanvasView(QWidget):
         pos = event.position()
         mm = self.screen_to_mm(pos.x(), pos.y())
         self.cursor_moved.emit(mm.x(), mm.y())
+        if self._tool is CanvasTool.TRACE:
+            self._trace_hover_mm = QPointF(mm)
         if self._panning and self._last_pos is not None:
             self._origin += pos - self._last_pos
             self._last_pos = pos
+            self._clamp_origin()
             self.update()
+            self._sync_scrollbars()
             return
         if self._crop_dragging and self._crop_anchor_mm is not None:
             p = self._clamp_crop_point(mm)
             self._crop_rect_mm = QRectF(self._crop_anchor_mm, p).normalized()
             self.update()
+            return
+        if self._trace_stroke_before is not None:
+            self._apply_trace(mm)
             return
         if self._brush_active:
             self._apply_brush(mm, self._tool)
@@ -1031,6 +1387,11 @@ class CanvasView(QWidget):
             self._crop_dragging = False
             self._crop_anchor_mm = None
             self.update()
+            return
+        if self._trace_stroke_before is not None and event.button() in (
+            Qt.LeftButton, Qt.RightButton
+        ):
+            self._end_trace()
             return
         if self._brush_active:
             self._end_brush()
@@ -1322,3 +1683,30 @@ class CanvasView(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        self._clamp_origin()
+        self._sync_scrollbars()
+
+
+class CanvasScrollHost(QWidget):
+    """The canvas plus its Photoshop-style scrollbar rails.
+
+    The rails live *outside* the canvas widget so the canvas keeps its own
+    coordinate space — every ``self.width()``/``self.height()`` use inside
+    :class:`CanvasView` still describes the full drawing area. The canvas owns
+    the scroll model; the host only supplies the chrome.
+    """
+
+    def __init__(self, canvas: CanvasView, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.canvas = canvas
+        self.hbar = QScrollBar(Qt.Horizontal, self)
+        self.vbar = QScrollBar(Qt.Vertical, self)
+        self.hbar.setToolTip("Scroll horizontally — or two-finger scroll on the canvas")
+        self.vbar.setToolTip("Scroll vertically — or two-finger scroll on the canvas")
+        grid = QGridLayout(self)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+        grid.addWidget(canvas, 0, 0)
+        grid.addWidget(self.vbar, 0, 1)
+        grid.addWidget(self.hbar, 1, 0)
+        canvas.attach_scrollbars(self.hbar, self.vbar)

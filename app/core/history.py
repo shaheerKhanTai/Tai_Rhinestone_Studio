@@ -224,6 +224,72 @@ class CompositeCommand(Command):
             command.undo()
 
 
+class PaintTraceCommand(Command):
+    """An undoable trace-tool stroke over an existing mask (paint or erase).
+
+    The canvas snapshots the whole mask at stroke start (a transient copy);
+    the command keeps only that snapshot's *changed bounding box* patch, so a
+    long session of strokes costs a few KB each, not a full raster per stroke.
+
+    Undo/redo swap the patch **in place** on the project's mask array, so
+    every reference to that array (the canvas overlay, a running generation
+    gate) stays valid. The first-ever stroke (mask was ``None``) is recorded
+    as a :class:`SetTraceMaskCommand` by the canvas instead — this command
+    requires a pre-existing mask.
+    """
+
+    def __init__(self, project, before, bbox, label: str = "Trace area", on_change=None) -> None:
+        from app.core.trace_mask import extract_patch
+
+        if before is None or bbox is None:
+            raise ValueError("PaintTraceCommand needs a before-mask and a changed bbox")
+        self._project = project
+        self._bbox = bbox
+        self._before_patch = extract_patch(before, bbox)
+        self._on_change = on_change
+        self.label = label
+
+    def _swap(self) -> None:
+        from app.core.trace_mask import apply_patch, extract_patch
+
+        mask = self._project.trace_mask
+        if mask is None:
+            return
+        current = extract_patch(mask, self._bbox)
+        apply_patch(mask, self._bbox, self._before_patch)
+        self._before_patch = current
+        if self._on_change is not None:
+            self._on_change()
+
+    def redo(self) -> None:
+        self._swap()
+
+    def undo(self) -> None:
+        self._swap()
+
+
+class SetTraceMaskCommand(Command):
+    """Swap the whole trace mask (Clear Traced Area, first stroke, its undo)."""
+
+    def __init__(self, project, before, after, on_change=None, label: str = "Clear trace") -> None:
+        self._project = project
+        self._before = before
+        self._after = after
+        self._on_change = on_change
+        self.label = label
+
+    def _apply(self, mask) -> None:
+        self._project.trace_mask = mask
+        if self._on_change is not None:
+            self._on_change()
+
+    def redo(self) -> None:
+        self._apply(self._after)
+
+    def undo(self) -> None:
+        self._apply(self._before)
+
+
 class CropCommand(Command):
     """An undoable image crop.
 

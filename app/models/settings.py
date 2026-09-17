@@ -15,8 +15,15 @@ from app.models.stone import resolve_diameter
 
 
 class PlacementMode(enum.Enum):
-    """Supported stone-layout strategies."""
+    """Supported stone-layout strategies.
 
+    ``OUTLINE`` is the default: shapes are traced with an even row of stones
+    along their contours and filled with a regular lattice — the professional
+    rhinestone look (no halftone dithering). The other modes render tonal
+    density as a dithered halftone, which suits photographs.
+    """
+
+    OUTLINE = "outline"
     GRID = "grid"
     OFFSET = "offset"
     HEXAGONAL = "hexagonal"
@@ -36,6 +43,7 @@ class PlacementMode(enum.Enum):
 
 
 _PLACEMENT_LABELS: dict[PlacementMode, str] = {
+    PlacementMode.OUTLINE: "Outline + Fill",
     PlacementMode.GRID: "Grid",
     PlacementMode.OFFSET: "Offset / Brick",
     PlacementMode.HEXAGONAL: "Hexagonal",
@@ -63,7 +71,7 @@ class GenerationSettings:
     stone_size_id: str = "SS10"
     custom_diameter_mm: float | None = None
     spacing_mm: float = 0.5
-    placement_mode: PlacementMode = PlacementMode.HEXAGONAL
+    placement_mode: PlacementMode = PlacementMode.OUTLINE
     #: Push All — dragging a stone pushes neighbours away to keep the spacing.
     push_all: bool = False
 
@@ -72,6 +80,14 @@ class GenerationSettings:
     contrast: float = 0.5
     smoothing: float = 0.3
     edge_preservation: float = 0.5
+
+    #: Tone polarity: ``False`` stones the dark parts of the image (the common
+    #: case), ``True`` the light parts (white lettering on a black shirt).
+    invert_tone: bool = False
+    #: Area inversion: ``True`` stones the *complement* of the region the image
+    #: would normally fill, shifting the pattern into the empty parts of the
+    #: same design. Fully transparent pixels stay empty in either polarity.
+    invert_areas: bool = False
 
     max_stones: int | None = None
 
@@ -120,6 +136,8 @@ class GenerationSettings:
             contrast=self.contrast,
             smoothing=self.smoothing,
             edge_preservation=self.edge_preservation,
+            invert_tone=self.invert_tone,
+            invert_areas=self.invert_areas,
             max_stones=self.max_stones,
         )
 
@@ -136,6 +154,8 @@ class GenerationSettings:
             "contrast": self.contrast,
             "smoothing": self.smoothing,
             "edge_preservation": self.edge_preservation,
+            "invert_tone": self.invert_tone,
+            "invert_areas": self.invert_areas,
             "max_stones": self.max_stones,
         }
 
@@ -148,12 +168,14 @@ class GenerationSettings:
                 else float(data["custom_diameter_mm"])
             ),
             spacing_mm=float(data.get("spacing_mm", 0.5)),
-            placement_mode=PlacementMode.from_str(str(data.get("placement_mode", "hexagonal"))),
+            placement_mode=PlacementMode.from_str(str(data.get("placement_mode", "outline"))),
             push_all=bool(data.get("push_all", False)),
             detail=float(data.get("detail", 0.5)),
             density=float(data.get("density", 0.5)),
             contrast=float(data.get("contrast", 0.5)),
             smoothing=float(data.get("smoothing", 0.3)),
             edge_preservation=float(data.get("edge_preservation", 0.5)),
+            invert_tone=bool(data.get("invert_tone", False)),
+            invert_areas=bool(data.get("invert_areas", False)),
             max_stones=(None if data.get("max_stones") is None else int(data["max_stones"])),
         )

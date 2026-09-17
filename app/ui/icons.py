@@ -342,6 +342,21 @@ def _reset(p: QPainter) -> None:
     p.drawLine(QPointF(8.5, 6.5), QPointF(12.5, 7.0))
 
 
+def _trace(p: QPainter) -> None:
+    """A freehand brush path dotted with stones it will place."""
+    path = QPainterPath()
+    path.moveTo(4, 18)
+    path.cubicTo(QPointF(8, 8), QPointF(14, 22), QPointF(20, 6))
+    pen = p.pen()
+    pen.setStyle(Qt.DashLine)
+    p.setPen(pen)
+    p.drawPath(path)
+    pen.setStyle(Qt.SolidLine)
+    p.setPen(pen)
+    for cx, cy, r in [(7, 15, 1.8), (12, 13, 1.8), (16, 9, 1.8)]:
+        p.drawEllipse(QPointF(cx, cy), r, r)
+
+
 _GLYPHS: dict[str, Callable[[QPainter], None]] = {
     "new": _new,
     "open": _open,
@@ -372,6 +387,7 @@ _GLYPHS: dict[str, Callable[[QPainter], None]] = {
     "flip_v": _flip_v,
     "crop": _crop,
     "reset": _reset,
+    "trace": _trace,
 }
 
 

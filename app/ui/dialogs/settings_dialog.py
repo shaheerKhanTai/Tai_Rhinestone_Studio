@@ -135,8 +135,14 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(box)
         self._show_grid = QCheckBox("Show grid")
         self._show_rulers = QCheckBox("Show rulers")
+        self._wheel_zooms = QCheckBox("Mouse wheel zooms the canvas")
+        self._wheel_zooms.setToolTip(
+            "Off: the wheel (and a touchpad's two-finger scroll) pans the canvas "
+            "and Ctrl/Alt+wheel zooms. On: the wheel zooms, as in earlier versions."
+        )
         layout.addWidget(self._show_grid)
         layout.addWidget(self._show_rulers)
+        layout.addWidget(self._wheel_zooms)
         self._bg_opacity = LabeledSlider(
             "Background image opacity", value=0.45, low_label="0%", high_label="100%"
         )
@@ -181,6 +187,7 @@ class SettingsDialog(QDialog):
         self._autosave_interval.setEnabled(s.autosave_enabled)
         self._show_grid.setChecked(s.show_grid)
         self._show_rulers.setChecked(s.show_rulers)
+        self._wheel_zooms.setChecked(s.wheel_zooms)
         self._bg_opacity.set_value(max(0, min(100, s.background_opacity)) / 100.0)
         self._analysis_dim.setValue(int(s.analysis_max_dim))
         self._confirm_overwrite.setChecked(s.confirm_before_overwrite)
@@ -208,6 +215,7 @@ class SettingsDialog(QDialog):
         out.show_grid = self._show_grid.isChecked()
         out.show_rulers = self._show_rulers.isChecked()
         out.background_opacity = int(round(self._bg_opacity.value() * 100))
+        out.wheel_zooms = self._wheel_zooms.isChecked()
         out.analysis_max_dim = self._analysis_dim.value()
         out.confirm_before_overwrite = self._confirm_overwrite.isChecked()
         out.confirm_delete_threshold = self._delete_threshold.value()

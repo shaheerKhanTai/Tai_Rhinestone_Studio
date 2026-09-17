@@ -44,7 +44,10 @@ class TestDesignPanel:
         panel.bind_project(proj)
         panel._detail.set_value(0.9)
         panel._spacing.setValue(0.8)
-        panel._mode_combo.setCurrentIndex(0)  # grid
+        # Select by data, not index — enum order is free to change.
+        grid_idx = panel._mode_combo.findData(PlacementMode.GRID)
+        assert grid_idx >= 0
+        panel._mode_combo.setCurrentIndex(grid_idx)
         s = panel.build_settings()
         assert s.detail == pytest.approx(0.9, abs=0.01)
         assert s.spacing_mm == pytest.approx(0.8)

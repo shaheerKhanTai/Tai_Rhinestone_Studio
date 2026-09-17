@@ -175,3 +175,37 @@ class TestAutosave:
         svc._tick()
         assert AutosaveService.has_recovery()
         AutosaveService.clear_recovery()
+
+
+class TestTraceMaskIO:
+    def test_roundtrip_preserves_mask(self, tmp_path):
+        from app.core.trace_mask import blank_mask, paint_stroke
+
+        p = sample_project(2)
+        p.set_physical_size(100.0, 100.0)
+        p.trace_mask = blank_mask(100.0, 100.0)
+        paint_stroke(p.trace_mask, (20.0, 50.0), (80.0, 50.0), 6.0, 100.0, 100.0)
+        out = project_service.save_project(p, tmp_path / "t.rhinestone")
+        loaded, _ = project_service.load_project(out)
+        assert loaded.trace_mask is not None
+        assert loaded.trace_mask.shape == p.trace_mask.shape
+        np.testing.assert_array_equal(loaded.trace_mask, p.trace_mask)
+
+    def test_maskless_project_loads_none(self, tmp_path):
+        p = sample_project(1)
+        out = project_service.save_project(p, tmp_path / "t.rhinestone")
+        loaded, _ = project_service.load_project(out)
+        assert loaded.trace_mask is None
+
+    def test_has_trace_flag_in_project_json(self, tmp_path):
+        import json
+        import zipfile
+
+        p = sample_project(1)
+        p.trace_mask = None
+        out = project_service.save_project(p, tmp_path / "t.rhinestone")
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+            data = json.loads(zf.read("project.json"))
+        assert "trace.png" not in names
+        assert data["has_trace"] is False

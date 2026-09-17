@@ -1,3 +1,9 @@
+
+
+
+
+
+
 """Application-wide preferences (distinct from a project's generation settings).
 
 Persisted as JSON in the per-user data directory. Kept free of UI types — the
@@ -27,6 +33,7 @@ class AppSettings:
     show_grid: bool = False
     show_rulers: bool = True
     background_opacity: int = 45             # 0..100, canvas image overlay
+    wheel_zooms: bool = False                # plain wheel zooms (off: scrolls the view)
     confirm_before_overwrite: bool = True
     confirm_delete_threshold: int = 25       # confirm bulk deletes above this
     analysis_max_dim: int = 1400             # performance: density analysis size
@@ -65,6 +72,7 @@ class AppSettings:
             "show_grid": self.show_grid,
             "show_rulers": self.show_rulers,
             "background_opacity": self.background_opacity,
+            "wheel_zooms": self.wheel_zooms,
             "confirm_before_overwrite": self.confirm_before_overwrite,
             "confirm_delete_threshold": self.confirm_delete_threshold,
             "analysis_max_dim": self.analysis_max_dim,
@@ -87,6 +95,7 @@ class AppSettings:
             show_grid=bool(data.get("show_grid", False)),
             show_rulers=bool(data.get("show_rulers", True)),
             background_opacity=int(data.get("background_opacity", 45)),
+            wheel_zooms=bool(data.get("wheel_zooms", False)),
             confirm_before_overwrite=bool(data.get("confirm_before_overwrite", True)),
             confirm_delete_threshold=int(data.get("confirm_delete_threshold", 25)),
             analysis_max_dim=int(data.get("analysis_max_dim", 1400)),

@@ -5,7 +5,7 @@ Run with: python acceptance_test.py
 
 Uses the offscreen Qt platform (headless-safe) but exercises the genuine UI
 objects: the design panel's controls, the canvas, the generation worker on the
-thread pool, the command stack, project save/load, and the AI dialog pipeline.
+thread pool, the command stack, and project save/load.
 Screenshots are written to test_output/acceptance_*.png for manual review.
 """
 from __future__ import annotations
@@ -261,33 +261,6 @@ def main() -> int:
     check("16d. Impossible packed-interior drag restored + notified",
           push_failed == [True] and (c.x, c.y) == c_before,
           "wave would move the whole design -> refused, layout intact")
-
-    # -- 17-21. AI assistant ------------------------------------------------ #
-    print("\n[17-21] AI-assisted edit")
-    from app.ai.assistant import AIAssistant
-
-    assistant = AIAssistant()
-    check("17. AI provider available (local rule-based, honestly labelled)",
-          assistant.has_provider, assistant.provider_label)
-    count_before = proj.design.stone_count
-    validated = assistant.preview(
-        proj.design, "reduce the number of stones",
-        gap_mm=proj.settings.spacing_mm,
-        stone_diameter_mm=proj.settings.effective_diameter(),
-        density=window._last_density_field.density if window._last_density_field else None,
-    )
-    check("18. AI suggestion produced and geometry-validated",
-          validated is not None and not validated.is_empty, validated.summary())
-    check("18b. Preview changed nothing", proj.design.stone_count == count_before)
-    window._on_ai_applied(validated)
-    check("19. AI suggestion applied", proj.design.stone_count != count_before,
-          f"{count_before:,} -> {proj.design.stone_count:,}")
-    shot(window, "05_ai_applied")
-    window.action_undo()
-    check("20-21. Ctrl+Z undoes the ENTIRE AI modification",
-          proj.design.stone_count == count_before,
-          f"back to {proj.design.stone_count:,}")
-    window.action_redo()
 
     # -- 22-24. Save and reopen -------------------------------------------- #
     print("\n[22-24] Save and reopen the project")

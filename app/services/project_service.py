@@ -7,7 +7,9 @@ A ``.rhinestone`` file is a ZIP container holding:
   (physical size, settings, every stone), so a project reopens to the exact
   design state with no dependency on temporary preview files;
 * ``image.png`` — the **embedded** source image (optional), so the project is
-  self-contained and portable even if the original file moves.
+  self-contained and portable even if the original file moves;
+* ``trace.png`` — the **embedded** trace-tool mask (optional, grayscale),
+  painted regions that gate where generation places stones.
 
 Loading treats the archive as untrusted input: only known member names are
 read (never ``extractall`` to disk), and a per-member size cap guards against
@@ -35,6 +37,7 @@ PROJECT_SUFFIX = ".rhinestone"
 _MANIFEST = "manifest.json"
 _PROJECT = "project.json"
 _IMAGE = "image.png"
+_TRACE = "trace.png"
 
 #: Reject any archive member that decompresses beyond this (guards zip bombs).
 _MAX_MEMBER_BYTES = 256 * 1024 * 1024  # 256 MB
@@ -65,6 +68,20 @@ def _decode_image_rgba(data: bytes) -> np.ndarray:
     return np.ascontiguousarray(arr, dtype=np.uint8)
 
 
+def _encode_trace_png(mask: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", np.ascontiguousarray(mask, dtype=np.uint8))
+    if not ok:
+        raise ProjectIOError("Could not encode trace mask")
+    return buf.tobytes()
+
+
+def _decode_trace_mask(data: bytes) -> np.ndarray:
+    arr = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    if arr is None or arr.ndim != 2:
+        raise ProjectIOError("Embedded trace mask is corrupt")
+    return np.ascontiguousarray((arr >= 128).astype(np.uint8) * 255)
+
+
 def save_project(project: Project, path: str | Path, source_image: LoadedImage | None = None) -> Path:
     """Write ``project`` (and optional embedded image) to a ``.rhinestone`` file.
 
@@ -80,6 +97,7 @@ def save_project(project: Project, path: str | Path, source_image: LoadedImage |
         "format_version": PROJECT_FORMAT_VERSION,
         "app_version": __version__,
         "has_image": source_image is not None,
+        "has_trace": project.trace_mask is not None,
     }
 
     tmp = path.with_name(path.name + ".tmp")
@@ -90,6 +108,8 @@ def save_project(project: Project, path: str | Path, source_image: LoadedImage |
             zf.writestr(_PROJECT, json.dumps(project.to_dict(), indent=2))
             if source_image is not None:
                 zf.writestr(_IMAGE, _encode_image_png(source_image))
+            if project.trace_mask is not None:
+                zf.writestr(_TRACE, _encode_trace_png(project.trace_mask))
         os.replace(tmp, path)
     except (OSError, zipfile.BadZipFile) as exc:
         try:
@@ -122,6 +142,15 @@ def load_project(path: str | Path) -> tuple[Project, LoadedImage | None]:
             if _IMAGE in names:
                 _guard_member_size(zf, _IMAGE)
                 image = loaded_from_array(_decode_image_rgba(zf.read(_IMAGE)))
+
+            # Trace mask (optional; absent in projects saved before the tool).
+            if _TRACE in names:
+                _guard_member_size(zf, _TRACE)
+                try:
+                    project.trace_mask = _decode_trace_mask(zf.read(_TRACE))
+                except ProjectIOError:
+                    _log.warning("Dropping corrupt trace mask in %s", path.name)
+                    project.trace_mask = None
     except (OSError, zipfile.BadZipFile) as exc:
         raise ProjectIOError(f"Could not open {path.name}: {exc}") from exc
     except (ValueError, KeyError) as exc:

@@ -495,9 +495,10 @@ def local_texture(gray01: np.ndarray, ksize: int = 5) -> np.ndarray:
 class DensityParams:
     """Slider values (all ``0..1``) that shape the density map.
 
-    Mirrors the UI controls. ``invert`` treats a light subject as foreground.
-    The rhinestone engine builds this from
-    :class:`~app.models.settings.GenerationSettings`.
+    Mirrors the UI controls. ``invert`` treats a light subject as foreground;
+    ``invert_areas`` stones the *complement* of the region the image would
+    otherwise fill (see :func:`build_density_map`). The rhinestone engine
+    builds this from :class:`~app.models.settings.GenerationSettings`.
     """
 
     detail: float = 0.5
@@ -506,6 +507,7 @@ class DensityParams:
     smoothing: float = 0.3
     edge_preservation: float = 0.5
     invert: bool = False
+    invert_areas: bool = False
 
 
 @dataclass(slots=True)
@@ -515,6 +517,17 @@ class DensityField:
     density: np.ndarray       # (H, W) float32 in [0, 1]
     grayscale: np.ndarray     # (H, W) float32 in [0, 1] (smoothed luminance)
     edges: np.ndarray         # (H, W) float32 in [0, 1]
+    #: Artwork silhouette (H, W) float32, values 0 or 1 — the region the
+    #: *image* occupies, as opposed to how dark it is. Taken from the alpha
+    #: channel when the image carries real transparency (the exact outline of
+    #: a transparent PNG/SVG), and ``None`` for fully opaque images, where the
+    #: artwork's edge can only be guessed from tone. Placement uses it to trace
+    #: the true outline and to keep stones on the artwork itself.
+    subject: np.ndarray | None = None
+    #: The flat backdrop an opaque image sits on (H, W) float32 0/1, or
+    #: ``None`` — see :func:`backdrop_mask`. Placement uses it to tell a design
+    #: exported on a dark background from the background itself.
+    backdrop: np.ndarray | None = None
 
     @property
     def width(self) -> int:
@@ -533,6 +546,121 @@ class DensityField:
         return float(self.density.mean()) if self.density.size else 0.0
 
 
+#: Dead-zone applied to the reinforced tone: densities below this level are
+#: treated as background (scan haze, JPEG noise, off-white paper) and receive
+#: no stones. Kept small so genuine light tonal areas still halftone.
+_TONE_FLOOR = 0.08
+
+#: Alpha level at or above which a pixel counts as artwork when the image has
+#: transparency. Half-opaque is the edge a viewer reads, so it is also where
+#: the traced outline belongs.
+_SUBJECT_ALPHA_MIN = 0.5
+
+#: Share of the image that must be transparent before the alpha channel counts
+#: as describing the artwork's *shape*. Below this the image is opaque in every
+#: way that matters — a stray soft edge, a resaved JPEG, an exporter that
+#: touched the alpha of a few pixels — and letting those few pixels define the
+#: silhouette would hand placement a frame-filling "shape" instead of the
+#: design.
+_SUBJECT_TRANSPARENCY_MIN = 0.01
+
+
+def subject_mask_from_alpha(alpha01: np.ndarray) -> np.ndarray | None:
+    """The artwork silhouette from the image's own alpha channel.
+
+    A transparent PNG/SVG states its outline exactly: every pixel is either
+    part of the artwork or not. Recovering the shape from *that* — rather than
+    from how dark the pixels happen to be — is what lets the engine trace the
+    real outline, and it is the only signal that works at all for artwork a
+    tone threshold cannot see: white, pastel or pale lettering on a transparent
+    background has almost no density anywhere, so a darkness-driven shape
+    detector finds nothing and generates no stones.
+
+    Returns ``None`` when the image is fully opaque (no transparency to read),
+    in which case the shape has to come from the tone field instead.
+    """
+    if alpha01.size == 0:
+        return None
+    transparent = alpha01 < _SUBJECT_ALPHA_MIN
+    if float(transparent.mean()) < _SUBJECT_TRANSPARENCY_MIN:
+        return None
+    return (~transparent).astype(np.float32)
+
+
+#: A backdrop must be flat, run to the image border and leave a real design
+#: beside it — see :func:`backdrop_mask`.
+_BACKDROP_BORDER = 0.02
+
+#: Luminance spread within that ring below which the image has a flat backdrop
+#: rather than subject matter running off its edges.
+_BACKDROP_FLATNESS = 0.06
+
+#: How far a pixel may sit from the backdrop's level and still match it.
+_BACKDROP_TOLERANCE = 0.10
+
+#: A backdrop must leave a real design beside it — it may not swallow the
+#: whole frame, and the design may not be a speck.
+_BACKDROP_MIN_SHARE = 0.5
+_BACKDROP_MAX_SHARE = 0.97
+
+
+def backdrop_mask(luminance01: np.ndarray, alpha01: np.ndarray) -> np.ndarray | None:
+    """The flat backdrop an opaque image sits on, or ``None`` when there is none.
+
+    Designs are often exported (or photographed) on a solid backdrop — a black
+    or coloured background with the artwork picked out in white on top of it.
+    That backdrop is *background*, but being dark it reads as the most
+    "subject-like" thing in the density map, so a shape conversion traced the
+    backdrop and left the design itself empty.
+
+    Recognising the backdrop is what lets placement follow the design instead:
+    it must
+
+    * be flat — a photo's dark areas, or any shaded region, vary too much to
+      qualify, so tonal artwork is never mistaken for a backdrop;
+    * reach the image's own border — a dark shape in the middle of a white
+      sheet is a subject, not a background (the flood starts from the border);
+    * be dominant, yet leave a real design beside it.
+
+    Returns a 0/1 ``float32`` mask, or ``None`` for images that are transparent
+    (there the alpha channel states the artwork directly) and for full-bleed
+    artwork or images without a flat backdrop at all.
+    """
+    if luminance01.size == 0 or luminance01.shape != alpha01.shape:
+        return None
+    if float((alpha01 < _SUBJECT_ALPHA_MIN).mean()) >= _SUBJECT_TRANSPARENCY_MIN:
+        return None
+    h, w = luminance01.shape
+    if h < 16 or w < 16:
+        return None
+
+    border = max(1, int(round(min(h, w) * _BACKDROP_BORDER)))
+    ring = np.concatenate([
+        luminance01[:border].ravel(), luminance01[-border:].ravel(),
+        luminance01[:, :border].ravel(), luminance01[:, -border:].ravel(),
+    ])
+    if float(ring.std()) > _BACKDROP_FLATNESS:
+        return None
+    level = float(ring.mean())
+
+    similar = (np.abs(luminance01 - level) <= _BACKDROP_TOLERANCE).astype(np.uint8)
+    if not similar.any():
+        return None
+    count, labels = cv2.connectedComponents(similar, connectivity=8)
+    if count <= 1:
+        return None
+    edges = np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])
+    touching = set(np.unique(edges).tolist()) - {0}
+    if not touching:
+        return None
+    backdrop = np.isin(labels, sorted(touching))
+
+    share = float(backdrop.mean())
+    if not (_BACKDROP_MIN_SHARE <= share <= _BACKDROP_MAX_SHARE):
+        return None
+    return backdrop.astype(np.float32)
+
+
 def build_density_map(
     luminance01: np.ndarray, alpha01: np.ndarray, params: DensityParams
 ) -> DensityField:
@@ -546,6 +674,37 @@ def build_density_map(
       low-density areas;
     * **detail** adds fine-texture regions to the coverage;
     * **density** applies a global gamma so higher values raise overall coverage.
+
+    Two guards keep the result on the design rather than all over the canvas:
+
+    * **Tone gating** — edges and texture multiply the subject's own darkness
+      instead of adding to it. A purely additive combination let the
+      (peak-normalised) edge/texture layers place stones over plain
+      background: JPEG noise, scan haze and faint gradients all reached full
+      scale after normalisation. Multiplicatively, the background stays empty
+      no matter how noisy it is, while subject contours and fine interior
+      detail are boosted up to 2.75× for crisper rendering.
+    * **Tone floor** — reinforced densities below :data:`_TONE_FLOOR` are
+      clamped to zero, absorbing residual background haze so it cannot
+      sprinkle isolated stones across empty regions.
+
+    ``invert_areas`` stones the **complement** of the region the image would
+    otherwise fill: the fully-toned subject becomes empty and the empty parts
+    of the design take the stones, so the pattern shifts into the negative
+    space of the same artwork. It is a true complement — the density is
+    reflected as ``1 - density`` *before* the alpha mask is applied, and then
+    put through the same :data:`_TONE_FLOOR` dead-zone as the forward
+    polarity, so a solid subject really does invert to empty rather than to a
+    stipple of its own residual tone. Three properties the placement stage
+    relies on are preserved:
+
+    * the same gradient is mirrored rather than flattened, so smooth tonal
+      transitions survive the inversion;
+    * transparent pixels still yield exactly zero density (transparency stays
+      a hard mask in either polarity — a transparent PNG logo does not
+      suddenly flood the artboard);
+    * the result is still a plain ``[0, 1]`` density map, so stone size,
+      pitch, margins and the canvas boundary are all untouched.
 
     Transparent pixels (alpha ``0``) always yield density ``0``.
     """
@@ -563,20 +722,46 @@ def build_density_map(
     edges = edge_magnitude(g)
     texture = local_texture(g)
 
-    density = tone.astype(np.float32)
-    density = density + float(params.edge_preservation) * edges
-    density = density + float(params.detail) * 0.5 * texture
-    density = np.clip(density, 0.0, 1.0)
+    # Reinforcement factor: 1.0 where there is no structure, up to
+    # 1 + edge_preservation + 0.5·detail on strong contours/texture.
+    reinforce = 1.0 + float(params.edge_preservation) * edges \
+        + 0.5 * float(params.detail) * texture
+    density = np.clip(tone * reinforce, 0.0, 1.0)
+
+    # Background dead-zone: sub-floor density is background, not faint subject.
+    density = np.clip((density - _TONE_FLOOR) / (1.0 - _TONE_FLOOR), 0.0, 1.0)
 
     # Global coverage gain: higher density slider -> smaller gamma -> brighter.
     gamma = 2.0 - 1.6 * float(params.density)
     density = np.power(density, gamma, dtype=np.float32)
 
+    # Area inversion: reflect the shading into the complementary region. Applied
+    # before the alpha mask so transparency stays a hard mask in both
+    # polarities (see the docstring).
+    if params.invert_areas:
+        density = 1.0 - density
+        # The mirror of the tone floor. A subject dense enough to read as solid
+        # (anything past _TONE_FLOOR of the way to full density) must invert to
+        # genuinely *empty*, not to a faint stipple of its own residual tone —
+        # artwork is rarely pure black, so an unfloored complement of a solid
+        # subject stipples specks across exactly the region the user asked to
+        # clear. Mid-tones still invert smoothly; only the near-solid tail is
+        # absorbed.
+        density = np.clip(
+            (density - _TONE_FLOOR) / (1.0 - _TONE_FLOOR), 0.0, 1.0
+        )
+
     # Respect transparency as a hard mask.
     density = density * alpha01.astype(np.float32)
     density = np.clip(density, 0.0, 1.0).astype(np.float32)
 
-    return DensityField(density=density, grayscale=g, edges=edges)
+    return DensityField(
+        density=density,
+        grayscale=g,
+        edges=edges,
+        subject=subject_mask_from_alpha(alpha01.astype(np.float32)),
+        backdrop=backdrop_mask(g, alpha01.astype(np.float32)),
+    )
 
 
 # --------------------------------------------------------------------------- #

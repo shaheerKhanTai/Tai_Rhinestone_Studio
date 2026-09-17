@@ -155,6 +155,59 @@ class TestStructurePreservation:
         assert in_eye_l > 0 and in_eye_r > 0 and in_mouth > 0
 
 
+class TestBackgroundSuppression:
+    """The design, not the whole canvas, must receive the stones."""
+
+    def test_noisy_offwhite_background_receives_no_stones(self):
+        # A dark subject on a noisy off-white background (scan haze / JPEG
+        # noise). The edge/texture layers are peak-normalised, so an additive
+        # density combination once covered the background in speckle stones;
+        # tone gating plus the tone floor must keep it essentially empty.
+        rng = np.random.default_rng(7)
+        bg = np.clip(235 + rng.normal(0, 12, (300, 300)), 0, 255).astype(np.uint8)
+        gray = np.stack([bg] * 3, axis=-1)
+        rgba = np.concatenate(
+            [gray, np.full((300, 300, 1), 255, np.uint8)], axis=-1
+        )
+        rgba[80:220, 80:220, :3] = 25  # dark square subject
+        res = generate(rgba, default_settings(), 100.0, 100.0, analysis_max_dim=600)
+        pos = res.placement.positions_mm
+        assert res.stone_count > 100  # the subject itself is well covered
+        # A one-pitch margin around the subject box (26.7..73.3 mm).
+        margin = PITCH
+        outside = int(np.sum((pos[:, 0] < 80 / 3 - margin) | (pos[:, 0] > 220 / 3 + margin) |
+                             (pos[:, 1] < 80 / 3 - margin) | (pos[:, 1] > 220 / 3 + margin)))
+        assert outside <= 3  # background stays empty (allow a straggler)
+
+    def test_edges_and_texture_cannot_create_background_stones(self):
+        # With maximal edge preservation and detail, a pure background strip
+        # (zero tone) must still receive zero stones: the reinforcement
+        # multiplies tone, it never adds to it.
+        gray = np.full((200, 200), 1.0)  # pure white everywhere
+        rgba = rgba_from_gray(gray)
+        res = generate(
+            rgba, default_settings(edge_preservation=1.0, detail=1.0),
+            100.0, 100.0, analysis_max_dim=400,
+        )
+        assert res.stone_count == 0
+
+
+class TestThinDetailCapture:
+    def test_thin_line_survives_placement(self):
+        # A stroke thinner than the stone pitch must still render as a
+        # contiguous run of stones, not vanish between lattice rows.
+        gray = np.full((300, 300), 0.98)
+        gray[148:152, :] = 0.02  # ~1.3 mm stroke on a 100 mm design
+        res = generate_from_gray(gray)
+        pos = res.placement.positions_mm
+        assert res.stone_count > 20
+        # The line spans the full width: stones must too.
+        assert pos[:, 0].min() < 10.0
+        assert pos[:, 0].max() > 90.0
+        # ... and they hug the line's y position (within a stone radius).
+        assert float(np.mean(np.abs(pos[:, 1] - 50.0) < PITCH)) > 0.95
+
+
 class TestSpacing:
     def test_no_overlaps_dark_image(self):
         # Densest case: a near-black image must still respect the pitch.

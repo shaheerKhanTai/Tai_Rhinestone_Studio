@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QThreadPool, Signal
+from PySide6.QtCore import QByteArray, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -69,7 +69,6 @@ class MainWindow(QMainWindow):
         self._thread_pool = QThreadPool.globalInstance()
         self._active_worker = None  # current GenerationWorker, if any
         self._command_stack = None  # app.core.history.CommandStack for the project
-        self._last_density_field = None  # DensityField of the last generation (AI input)
 
         self.setWindowTitle(__app_name__)
         self.setMinimumSize(1024, 680)
@@ -92,8 +91,6 @@ class MainWindow(QMainWindow):
         self._update_action_states()
         # Offer recovery once the window is up (deferred so construction never
         # blocks on a modal — also keeps headless tests non-blocking).
-        from PySide6.QtCore import QTimer
-
         QTimer.singleShot(0, self._maybe_offer_recovery)
 
     # ------------------------------------------------------------------ #
@@ -236,10 +233,9 @@ class MainWindow(QMainWindow):
                                              shortcut="Ctrl+G", slot=self.action_generate)
         self.act_resolve = self._add_action("Resolve Collisions", icon="resolve",
                                             slot=self.action_resolve_collisions)
-        self.act_ai = self._add_action("AI Assistant…", icon="resolve",
-                                       slot=self.action_ai_assistant,
-                                       tip="Suggest, preview and apply structured "
-                                           "stone edits (runs locally)")
+        self.act_clear_trace = self._add_action("Clear Traced Area", icon="reset",
+                                                tip="Remove the traced region so Generate uses the whole image",
+                                                slot=self.action_clear_trace)
 
         # Editing tools (exclusive checkable group).
         from app.ui.canvas import CanvasTool
@@ -263,9 +259,15 @@ class MainWindow(QMainWindow):
                                               shortcut="C", checkable=True,
                                               tip="Drag a crop area, then Enter to apply (Esc to cancel)",
                                               slot=self._enter_crop_mode)
+        self.act_tool_trace = self._add_action("Trace Area", icon="trace",
+                                               shortcut="T", checkable=True,
+                                               tip="Paint the areas that should receive rhinestones; "
+                                                   "right-drag erases. Generate fills only traced areas",
+                                               slot=lambda: self._set_tool(CanvasTool.TRACE))
         self._tool_group = QActionGroup(self)
         for a in (self.act_tool_select, self.act_tool_add, self.act_tool_delete,
-                  self.act_tool_brush, self.act_tool_eraser, self.act_tool_crop):
+                  self.act_tool_brush, self.act_tool_eraser, self.act_tool_crop,
+                  self.act_tool_trace):
             self._tool_group.addAction(a)
         self.act_tool_select.setChecked(True)
 
@@ -331,11 +333,12 @@ class MainWindow(QMainWindow):
         m_design = mb.addMenu("&Design")
         m_design.addAction(self.act_generate)
         m_design.addAction(self.act_resolve)
-        m_design.addAction(self.act_ai)
+        m_design.addAction(self.act_clear_trace)
         m_design.addSeparator()
         m_tools = m_design.addMenu("Tools")
         for a in (self.act_tool_select, self.act_tool_add, self.act_tool_delete,
-                  self.act_tool_brush, self.act_tool_eraser, self.act_tool_crop):
+                  self.act_tool_brush, self.act_tool_eraser, self.act_tool_crop,
+                  self.act_tool_trace):
             m_tools.addAction(a)
 
         m_help = mb.addMenu("&Help")
@@ -355,7 +358,8 @@ class MainWindow(QMainWindow):
             tb.addWidget(self._tool_button(act))
         tb.addSeparator()
         for act in (self.act_tool_select, self.act_tool_add, self.act_tool_delete,
-                    self.act_tool_brush, self.act_tool_eraser, self.act_tool_crop):
+                    self.act_tool_brush, self.act_tool_eraser, self.act_tool_crop,
+                    self.act_tool_trace):
             tb.addWidget(self._tool_button(act))
         tb.addSeparator()
         for act in (self.act_undo, self.act_redo):
@@ -424,12 +428,13 @@ class MainWindow(QMainWindow):
         self.resizeDocks([self._left_dock], [320], Qt.Horizontal)
 
     def _build_canvas(self) -> None:
-        from app.ui.canvas import CanvasView
+        from app.ui.canvas import CanvasScrollHost, CanvasView
 
         self._canvas = CanvasView(self._theme)
         self._canvas.set_show_grid(self.app_settings.show_grid)
         self._canvas.set_show_rulers(self.app_settings.show_rulers)
         self._canvas.set_background_opacity(self.app_settings.background_opacity)
+        self._canvas.set_wheel_zooms(self.app_settings.wheel_zooms)
         self._canvas.zoom_changed.connect(self.set_status_zoom)
         self._canvas.cursor_moved.connect(self._on_cursor_moved)
         self._canvas.selection_changed.connect(self._on_selection_changed)
@@ -438,10 +443,31 @@ class MainWindow(QMainWindow):
         self._canvas.crop_committed.connect(self._on_crop_committed)
         self._canvas.crop_cancelled.connect(self._on_crop_cancelled)
         self._canvas.push_failed.connect(self._on_push_failed)
-        self.set_canvas(self._canvas)
+        self._canvas.trace_changed.connect(self._on_trace_changed)
+        self._canvas.trace_mask_replaced.connect(self._on_trace_changed)
+        # The canvas travels inside its scrollbar rails; ``_canvas`` stays the
+        # CanvasView so every call site keeps talking to the view itself.
+        self._canvas_scroller = CanvasScrollHost(self._canvas)
+        self.set_canvas(self._canvas_scroller)
 
     def _set_tool(self, tool) -> None:
         self._canvas.set_tool(tool)
+        from app.ui.canvas import CanvasTool
+
+        if tool is CanvasTool.TRACE:
+            self.show_status_message(
+                "Trace: drag to paint areas for rhinestones — right-drag erases. "
+                "Generate fills only the traced areas", 6000
+            )
+
+    def _on_trace_changed(self) -> None:
+        """A trace stroke / clear / history swap happened — sync state."""
+        if not self.state.has_project:
+            return
+        self._canvas.resync_trace_to_project()
+        self.state.mark_dirty(True)
+        self._update_title()
+        self._update_action_states()
 
     def _on_command_produced(self, command) -> None:
         """Record an already-applied edit command from the canvas."""
@@ -492,12 +518,42 @@ class MainWindow(QMainWindow):
         self._stats_panel = StatisticsPanel()
         self.set_right_panel(self._stats_panel)
 
+        # Fit the left dock to what the sidebar actually needs at this font /
+        # DPI, instead of a hardcoded 320 px that clips wide-font systems.
+        self._fit_left_dock()
+
+    def _fit_left_dock(self, *, only_grow: bool = False) -> None:
+        """Resize the Design dock so the sidebar fits without clipping.
+
+        The scroll area's minimum width is set to what the sidebar content
+        needs, so the layout itself guarantees no horizontal scrollbar rides
+        across the options; ``resizeDocks`` then nudges the dock to that size
+        (fonts differ per system, so the old hardcoded 320 px clipped on
+        wide-font machines).
+
+        With ``only_grow`` a restored user-chosen width is respected unless it
+        is too narrow for the content.
+        """
+        if self._design_panel is None:
+            return
+        needed = self._design_panel.minimumSizeHint().width()
+        # Scrollbar + scroll-area frame + dock margins.
+        needed += self._left_scroll.verticalScrollBar().sizeHint().width() + 16
+        # Never eat more than 45% of the window, never less than the old 320.
+        max_w = int(self.width() * 0.45)
+        width = max(320, min(needed, max_w))
+        if only_grow and self._left_dock.width() >= width:
+            return
+        self._left_scroll.setMinimumWidth(min(needed, max_w))
+        self.resizeDocks([self._left_dock], [width], Qt.Horizontal)
+
     def _on_size_changed(self) -> None:
         if not self.state.has_project:
             return
         proj = self.state.project
         self._canvas.set_unit(proj.units)
         self._canvas.set_design(proj.design, fit=True)
+        self._resample_trace(proj)
         self.set_status_dimensions(
             f"{proj.width_in_units:.2f} × {proj.height_in_units:.2f} {proj.units.symbol}"
         )
@@ -524,6 +580,15 @@ class MainWindow(QMainWindow):
         color = self.state.project.design.stones[0].color if self.state.project.design.stone_count else "#1F2933"
         self._canvas.set_new_stone_spec(diameter, s.stone_size_id, color, s.spacing_mm)
         self._canvas.set_push_all(s.push_all)
+
+    def _resample_trace(self, proj: Project) -> None:
+        """Adopt the trace mask to the project's (possibly changed) aspect."""
+        if proj.trace_mask is None:
+            return
+        from app.core.trace_mask import resample_mask
+
+        proj.trace_mask = resample_mask(proj.trace_mask, proj.width_mm, proj.height_mm)
+        self._canvas.set_trace_mask(proj.trace_mask)
 
     def _on_push_failed(self) -> None:
         """Push All could not resolve the movement; the canvas restored the layout."""
@@ -604,6 +669,10 @@ class MainWindow(QMainWindow):
         self._left_dock.setVisible(True)
         self._right_dock.setVisible(True)
         self._toolbar.setVisible(True)
+        # The docks were hidden while the welcome screen was up, and
+        # ``resizeDocks`` is ignored on hidden docks — so the sidebar's width
+        # is only now adjustable. Fit it before the user sees a clipped panel.
+        self._fit_left_dock()
         self._update_title()
 
     # ------------------------------------------------------------------ #
@@ -637,20 +706,19 @@ class MainWindow(QMainWindow):
     def action_import_image(self) -> None:
         start_dir = self.app_settings.default_export_dir or str(Path.home())
         path, _ = QFileDialog.getOpenFileName(self, "Import Image", start_dir, _IMAGE_FILTER)
-        if not path:
-            return
-        self._import_image_path(Path(path))
+        if path:
+            self._import_image_path(Path(path))
 
-    def _import_image_path(self, path: Path) -> None:
+    def _import_image_path(self, path: Path) -> bool:
         try:
             loaded = load_image(path)
         except ImageLoadError as exc:
             self.show_error("Could not open image", str(exc))
-            return
+            return False
         except Exception as exc:  # pragma: no cover - unexpected decode failure
             _log.exception("Unexpected image load error")
             self.show_error("Could not open image", f"An unexpected error occurred:\n{exc}")
-            return
+            return False
 
         project = self.state.project or Project.new(path.stem)
         if not self.state.has_project:
@@ -671,6 +739,7 @@ class MainWindow(QMainWindow):
         self.state.source_image = loaded
         self._set_project(project, file_path=self.state.file_path, dirty=True)
         self.show_status_message(f"Imported {path.name} ({loaded.width}×{loaded.height}px)", 5000)
+        return True
 
     # ------------------------------------------------------------------ #
     # Image transforms (rotate / flip / reset — engine already applies them)
@@ -733,6 +802,7 @@ class MainWindow(QMainWindow):
             h, w = oriented.shape[:2]
             w_mm, h_mm = fit_dimensions(w, h, proj.width_mm, lock_aspect=True)
             proj.set_physical_size(w_mm, h_mm)
+            self._resample_trace(proj)
         self._canvas.set_unit(proj.units)
         self._canvas.set_design(proj.design, fit=True)
         self._design_panel.bind_project(proj)  # resync width/height fields
@@ -791,6 +861,7 @@ class MainWindow(QMainWindow):
         # Apply the crop live so the recomputed size/stones reflect STATE B.
         proj.image.crop = new_crop
         self._refresh_image_view(recompute_size=True)
+        self._resample_trace(proj)
         new_size = (proj.width_mm, proj.height_mm)
         # Cropping the image field invalidates the existing stone layout (the
         # image-to-canvas mapping changed), so the design is cleared — a fresh
@@ -983,6 +1054,7 @@ class MainWindow(QMainWindow):
         self._canvas.set_show_grid(new.show_grid)
         self._canvas.set_show_rulers(new.show_rulers)
         self._canvas.set_background_opacity(new.background_opacity)
+        self._canvas.set_wheel_zooms(new.wheel_zooms)
         self.act_show_grid.setChecked(new.show_grid)
         self._update_action_states()
 
@@ -1106,15 +1178,29 @@ class MainWindow(QMainWindow):
         self._canvas.clear_selection()
 
     def action_reset_layout(self) -> None:
-        self.resizeDocks([self._left_dock, self._right_dock], [320, 260], Qt.Horizontal)
+        self.resizeDocks([self._right_dock], [260], Qt.Horizontal)
+        self._fit_left_dock()
         self._left_dock.setVisible(True)
         self._right_dock.setVisible(True)
+
+    def action_clear_trace(self) -> None:
+        if self._canvas.has_trace():
+            self._canvas.clear_trace()
+            self.show_status_message("Traced area cleared — Generate now uses the whole image", 4000)
 
     def action_generate(self) -> None:
         if self._active_worker is not None:
             return  # already running
         if not self.state.has_project or not self.state.has_image:
             self.show_status_message("Import an image before generating", 4000)
+            return
+        from app.core.trace_mask import mask_is_empty
+
+        if self.state.project.trace_mask is not None and mask_is_empty(self.state.project.trace_mask):
+            self.show_status_message(
+                "The traced area is empty — paint it with the Trace tool "
+                "(T) or clear the trace to use the whole image", 6000
+            )
             return
         from app.core.image_processor import apply_image_transforms
         from app.ui.generation_worker import GenerationWorker
@@ -1137,12 +1223,13 @@ class MainWindow(QMainWindow):
             flip_v=proj.image.flip_v,
             crop=proj.image.crop,
         )
-        invert = bool(self._design_panel._invert.isChecked())
 
+        # Tone polarity and area inversion ride on the settings (they are part
+        # of the project document, so they survive save/reopen).
         worker = GenerationWorker(
             rgba, settings, proj.width_mm, proj.height_mm,
-            invert=invert,
             analysis_max_dim=self.app_settings.analysis_max_dim,
+            trace_mask=proj.trace_mask,
         )
         worker.signals.progress.connect(self._design_panel.set_progress)
         worker.signals.batch.connect(self._on_generation_batch)
@@ -1168,7 +1255,7 @@ class MainWindow(QMainWindow):
             self.show_status_message("Cancelling…", 2000)
 
     def _on_generation_finished(self, result) -> None:
-        from app.core.history import ReplaceDesignCommand
+        from app.core.history import CompositeCommand, ReplaceDesignCommand
 
         self._active_worker = None
         proj = self.state.project
@@ -1176,12 +1263,32 @@ class MainWindow(QMainWindow):
             return
         old_stones = list(proj.design.stones)
         proj.design.replace_all(result.stones)
-        # Retain the density field for the AI assistant (in-memory only).
-        self._last_density_field = result.density_field
-        # Record as an undoable step (effect already applied).
+
+        # FEATURE 1 — a successful generation consumes the traced region: the
+        # overlay and the project's mask are both cleared, so the next Generate
+        # uses the whole image rather than silently re-using a stale gate. Only
+        # the trace *state* is touched — the stones just placed and the source
+        # image are untouched.
+        #
+        # A run that placed nothing keeps the trace: the user almost certainly
+        # wants to adjust density and Generate again over the same painting,
+        # so throwing it away would discard their work for no gain.
+        cleared_trace = False
+        commands: list = []
+        if result.stone_count > 0:
+            clear_cmd = self._canvas.clear_trace_command(label="Clear traced area")
+            if clear_cmd is not None:
+                commands.append(clear_cmd)
+                cleared_trace = True
+        commands.append(
+            ReplaceDesignCommand(proj.design, old_stones, list(result.stones))
+        )
+        label = "Generate design (traced area)" if cleared_trace else "Generate design"
         if self._command_stack is not None:
+            # One undoable step: Ctrl+Z restores the previous stones *and* the
+            # traced area together, so undo never lands on a half-reverted state.
             self._command_stack.push_applied(
-                ReplaceDesignCommand(proj.design, old_stones, list(result.stones))
+                commands[0] if len(commands) == 1 else CompositeCommand(commands, label=label)
             )
         self._design_panel.set_generating(False)
         # Replaces the streamed preview with the authoritative final stones.
@@ -1192,10 +1299,22 @@ class MainWindow(QMainWindow):
         self.state.mark_dirty(True)
         self._update_title()
         self._update_action_states()
-        msg = f"Generated {proj.design.stone_count:,} stones"
+        self.show_status_message(self._generation_summary(result, cleared_trace), 6000)
+
+    def _generation_summary(self, result, cleared_trace: bool) -> str:
+        """User-facing summary of a finished generation pass."""
+        count = result.stone_count
+        if count == 0:
+            return (
+                "Generated 0 stones — nothing matched the current settings. "
+                "Try a higher Density, a lighter subject, or check the traced area."
+            )
+        msg = f"Generated {count:,} stones"
         if result.was_limited:
             msg += f" (limited from {result.total_before_limit:,})"
-        self.show_status_message(msg, 6000)
+        if cleared_trace:
+            msg += " · traced area cleared"
+        return msg
 
     def _on_generation_cancelled(self) -> None:
         self._active_worker = None
@@ -1264,75 +1383,6 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------ #
-    # AI assistant (Issue 6)
-    # ------------------------------------------------------------------ #
-    def action_ai_assistant(self) -> None:
-        from app.ai.assistant import AIAssistant
-        from app.ui.dialogs.ai_dialog import AIAssistantDialog
-
-        proj = self.state.project
-        if proj is None or proj.design.stone_count == 0:
-            return
-        assistant = AIAssistant()
-        if not assistant.has_provider:
-            self.show_status_message("No AI provider is available", 5000)
-            return
-
-        # Focus region: the bounds of the current selection, else the whole design.
-        region = None
-        selected = proj.design.selected_stones()
-        if selected:
-            xs = [s.x for s in selected]
-            ys = [s.y for s in selected]
-            pad = proj.settings.center_distance()
-            region = (
-                max(0.0, min(xs) - pad),
-                max(0.0, min(ys) - pad),
-                min(proj.width_mm, max(xs) - min(xs) + 2 * pad),
-                min(proj.height_mm, max(ys) - min(ys) + 2 * pad),
-            )
-
-        density = None
-        if self._last_density_field is not None:
-            density = self._last_density_field.density
-
-        dlg = AIAssistantDialog(
-            assistant, proj.design, self._canvas,
-            gap_mm=proj.settings.spacing_mm,
-            stone_diameter_mm=proj.settings.effective_diameter(),
-            density=density,
-            region=region,
-            parent=self,
-        )
-        dlg.applied.connect(self._on_ai_applied)
-        dlg.discard_requested.connect(
-            lambda: self.show_status_message("AI suggestion rejected", 3000)
-        )
-        dlg.exec()
-
-    def _on_ai_applied(self, validated) -> None:
-        """Apply a user-approved AI suggestion as ONE undoable command."""
-        from app.ai.assistant import AIAssistant
-
-        proj = self.state.project
-        if proj is None:
-            return
-        assistant = AIAssistant()
-        try:
-            command = assistant.apply(validated, proj.design)
-        except Exception as exc:  # geometry defence — the design changed mid-flow
-            _log.exception("AI apply failed")
-            self.show_error("Could not apply AI suggestion", str(exc))
-            return
-        if command is None:
-            return
-        if self._command_stack is not None:
-            self._command_stack.do(command)  # executes + records atomically
-        self._after_history_change()
-        n = len(validated.valid_ops)
-        self.show_status_message(f"Applied AI suggestion ({n} operations)", 5000)
-
-    # ------------------------------------------------------------------ #
     # Project plumbing
     # ------------------------------------------------------------------ #
     def _set_project(self, project: Project, file_path: Path | None, dirty: bool = False) -> None:
@@ -1341,7 +1391,6 @@ class MainWindow(QMainWindow):
         self.state.project = project
         self.state.file_path = file_path
         self.state.dirty = dirty
-        self._last_density_field = None  # a different project invalidates it
         # Note: the caller owns state.source_image (set before calling); we do
         # not clear it here, so embedded/in-memory images survive _set_project.
         # Fresh undo history per project.
@@ -1349,7 +1398,9 @@ class MainWindow(QMainWindow):
         self._command_stack.on_change = self._on_history_changed
         # Sync the canvas with the project.
         self._canvas.set_unit(project.units)
+        self._canvas.set_project(project)
         self._canvas.set_background_image(self._current_oriented_rgba())
+        self._canvas.set_trace_mask(project.trace_mask)
         self._canvas.set_design(project.design, fit=True)
         self._sync_canvas_stone_spec()
         # Bind the panels.
@@ -1400,15 +1451,17 @@ class MainWindow(QMainWindow):
             act.setEnabled(has_image)
         for act in (self.act_export_svg, self.act_export_cricut, self.act_export_dxf,
                     self.act_export_png, self.act_export_pdf, self.act_export_pkg,
-                    self.act_resolve, self.act_ai, self.act_select_all,
+                    self.act_resolve, self.act_select_all,
                     self.act_deselect, self.act_delete):
             act.setEnabled(has_design)
         # Editing tools require an open project.
         for act in (self.act_tool_select, self.act_tool_add, self.act_tool_delete,
-                    self.act_tool_brush, self.act_tool_eraser):
+                    self.act_tool_brush, self.act_tool_eraser, self.act_tool_trace):
             act.setEnabled(has_project)
         # Cropping needs an image to crop.
         self.act_tool_crop.setEnabled(has_image)
+        # Clearing needs a painted trace.
+        self.act_clear_trace.setEnabled(self._canvas.has_trace())
         # Undo/redo reflect the command stack.
         stack = self._command_stack
         self.act_undo.setEnabled(bool(stack and stack.can_undo))
@@ -1475,6 +1528,9 @@ class MainWindow(QMainWindow):
             self.resize(1360, 860)
         if isinstance(state, QByteArray) and not state.isEmpty():
             self.restoreState(state)
+        # A restored dock width may predate this machine's font metrics —
+        # widen it if the sidebar no longer fits.
+        self._fit_left_dock(only_grow=True)
 
     def _save_window_state(self) -> None:
         from PySide6.QtCore import QSettings

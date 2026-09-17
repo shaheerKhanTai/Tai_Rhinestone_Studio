@@ -198,9 +198,16 @@ Watch the progress bar for generation stages:
 The canvas shows your design with individual rhinestones as circles.
 
 **Canvas controls:**
-- **Mouse wheel** - Zoom in/out
+- **Scroll** (mouse wheel or two-finger touchpad) - Pan left/right/up/down
+- **Scrollbars** - Drag the rails on the right and bottom edges to move around
+- **Ctrl + scroll** (or **Alt + scroll**) - Zoom in/out about the cursor
 - **Space + drag** - Pan
 - **Fit to screen** - View entire design
+
+When the design is larger than the window the scrollbars become active and show how
+much of it is on screen; zoomed out, they sit full as there is nothing to scroll.
+Prefer the older behaviour? **File ▸ Settings… ▸ Canvas ▸ "Mouse wheel zooms the
+canvas"** puts zoom back on the plain wheel.
 
 **Editing tools:**
 - **Select** - Click to select stones
@@ -239,10 +246,10 @@ Choose your export format:
 | Redo | `Ctrl+Y` |
 | Select All | `Ctrl+A` |
 | Delete Selected | `Delete` |
-| Zoom In | `Ctrl++` or `Mouse Wheel Up` |
-| Zoom Out | `Ctrl+-` or `Mouse Wheel Down` |
+| Zoom In | `Ctrl++` or `Ctrl/Alt + scroll up` |
+| Zoom Out | `Ctrl+-` or `Ctrl/Alt + scroll down` |
 | Fit to Screen | `Ctrl+0` |
-| Pan Canvas | `Space + Drag` |
+| Pan Canvas | `Scroll`, `Space + Drag`, or the scrollbars |
 
 ---
 

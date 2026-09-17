@@ -122,9 +122,11 @@ class TestSettingsWiring:
         new = AppSettings.from_dict(window.app_settings.to_dict())
         new.show_grid = True
         new.background_opacity = 80
+        new.wheel_zooms = True
         window._apply_app_settings(new)
         assert window.act_show_grid.isChecked()
         assert window._canvas._show_grid is True
+        assert window._canvas._wheel_zooms is True
 
     def test_apply_reconfigures_autosave(self, window):
         new = AppSettings.from_dict(window.app_settings.to_dict())
