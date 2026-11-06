@@ -98,6 +98,66 @@ class TestSettingsDialog:
         assert dialog.result_settings().default_export_dir is None
 
 
+class TestDialogSizing:
+    """The dialog must be fully reachable on any display.
+
+    The reported problem was the window running off the bottom of the screen
+    with no way to scroll to the lower groups, so these pin both halves of the
+    fix: the dialog sizes itself to the screen it opens on, and the groups
+    scroll inside it independently of the button box.
+    """
+
+    def test_groups_live_in_a_scroll_area(self, dialog):
+        from PySide6.QtWidgets import QScrollArea
+
+        assert isinstance(dialog._scroll, QScrollArea)
+        assert dialog._scroll.widget() is not None
+        assert dialog._scroll.widgetResizable() is True
+
+    def test_button_box_is_outside_the_scroll_area(self, dialog):
+        """OK / Cancel must never be scrolled off — they are not in the scroller."""
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        box = dialog.findChild(QDialogButtonBox)
+        assert box is not None
+        # The scroll area must not be an ancestor of the button box.
+        ancestor = box.parentWidget()
+        while ancestor is not None:
+            assert ancestor is not dialog._scroll
+            ancestor = ancestor.parentWidget()
+
+    def test_dialog_fits_the_available_screen(self, dialog):
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        assert screen is not None
+        available = screen.availableGeometry()
+        assert dialog.width() <= available.width()
+        assert dialog.height() <= available.height()
+
+    def test_dialog_is_at_least_the_minimum_size(self, dialog):
+        from app.ui.dialogs.settings_dialog import _MIN_HEIGHT, _MIN_WIDTH
+
+        assert dialog.width() >= _MIN_WIDTH
+        assert dialog.height() >= _MIN_HEIGHT
+
+    def test_scaling_up_keeps_every_group_present(self, dialog):
+        """Sizing must not drop controls — they all still exist and are reachable."""
+        for name in ("_theme_combo", "_units_combo", "_stone_combo", "_export_dir",
+                     "_autosave_enabled", "_autosave_interval", "_show_grid",
+                     "_show_rulers", "_wheel_zooms", "_bg_opacity", "_analysis_dim",
+                     "_confirm_overwrite", "_delete_threshold"):
+            assert getattr(dialog, name) is not None, name
+
+    def test_restore_defaults_refits(self, dialog):
+        from PySide6.QtGui import QGuiApplication
+
+        dialog.resize(2000, 2000)
+        dialog._restore_defaults()
+        available = QGuiApplication.primaryScreen().availableGeometry()
+        assert dialog.height() <= available.height()
+
+
 @pytest.fixture()
 def window(qapp):
     from app.ui.main_window import MainWindow

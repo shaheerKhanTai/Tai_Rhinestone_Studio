@@ -17,12 +17,19 @@ from app.models.stone import resolve_diameter
 class PlacementMode(enum.Enum):
     """Supported stone-layout strategies.
 
-    ``OUTLINE`` is the default: shapes are traced with an even row of stones
-    along their contours and filled with a regular lattice — the professional
-    rhinestone look (no halftone dithering). The other modes render tonal
-    density as a dithered halftone, which suits photographs.
+    ``AUTOMATIC`` is the default: the engine reads the artwork, splits it into
+    flat shapes and tonal (photographic) regions, and gives each the treatment
+    it needs — an even row of stones on the contours plus a regular lattice
+    fill for the flat parts, a density-following scatter for the shaded parts.
+    The user does not have to know which kind of image they have.
+
+    The remaining modes are the manual choices. ``OUTLINE`` applies the
+    shape treatment to the whole design (the professional non-dithered look),
+    while ``GRID``, ``OFFSET``, ``HEXAGONAL`` and ``ORGANIC`` render the whole
+    design as a dithered halftone, which suits photographs.
     """
 
+    AUTOMATIC = "automatic"
     OUTLINE = "outline"
     GRID = "grid"
     OFFSET = "offset"
@@ -43,6 +50,7 @@ class PlacementMode(enum.Enum):
 
 
 _PLACEMENT_LABELS: dict[PlacementMode, str] = {
+    PlacementMode.AUTOMATIC: "Automatic (Smart)",
     PlacementMode.OUTLINE: "Outline + Fill",
     PlacementMode.GRID: "Grid",
     PlacementMode.OFFSET: "Offset / Brick",
@@ -71,7 +79,7 @@ class GenerationSettings:
     stone_size_id: str = "SS10"
     custom_diameter_mm: float | None = None
     spacing_mm: float = 0.5
-    placement_mode: PlacementMode = PlacementMode.OUTLINE
+    placement_mode: PlacementMode = PlacementMode.AUTOMATIC
     #: Push All — dragging a stone pushes neighbours away to keep the spacing.
     push_all: bool = False
 
@@ -168,7 +176,7 @@ class GenerationSettings:
                 else float(data["custom_diameter_mm"])
             ),
             spacing_mm=float(data.get("spacing_mm", 0.5)),
-            placement_mode=PlacementMode.from_str(str(data.get("placement_mode", "outline"))),
+            placement_mode=PlacementMode.from_str(str(data.get("placement_mode", "automatic"))),
             push_all=bool(data.get("push_all", False)),
             detail=float(data.get("detail", 0.5)),
             density=float(data.get("density", 0.5)),

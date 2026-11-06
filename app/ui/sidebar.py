@@ -63,12 +63,67 @@ class DesignPanel(QWidget):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(14)
 
+        # The error banner lives at the very top of the panel and stays hidden
+        # until something fails. It is deliberately persistent: the dialog that
+        # reports a failure is dismissed and forgotten, but the reason a design
+        # did not generate is exactly what the user needs to see *while*
+        # adjusting the settings below it.
+        root.addWidget(self._build_error_banner())
         root.addWidget(self._build_image_group())
         root.addWidget(self._build_size_group())
         root.addWidget(self._build_stone_group())
         root.addWidget(self._build_density_group())
         root.addWidget(self._build_generate_block())
         root.addStretch(1)
+
+    def _build_error_banner(self) -> QWidget:
+        # Object names, not dynamic properties: the theme sheet matches these
+        # by ID (see ``build_qss``), which is a direct lookup rather than an
+        # ancestry walk across every widget in the application.
+        frame = QFrame()
+        frame.setObjectName("errorBanner")
+        frame.setVisible(False)
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(10, 8, 6, 8)
+        lay.setSpacing(8)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        self._error_title = QLabel("")
+        self._error_title.setObjectName("errorBannerTitle")
+        self._error_title.setWordWrap(True)
+        self._error_detail = QLabel("")
+        self._error_detail.setObjectName("errorBannerDetail")
+        self._error_detail.setWordWrap(True)
+        text_col.addWidget(self._error_title)
+        text_col.addWidget(self._error_detail)
+        lay.addLayout(text_col, 1)
+
+        dismiss = QToolButton()
+        dismiss.setObjectName("errorBannerClose")
+        dismiss.setText("✕")
+        dismiss.setAutoRaise(True)
+        dismiss.setToolTip("Dismiss this message")
+        dismiss.setCursor(Qt.ArrowCursor)
+        dismiss.clicked.connect(self.clear_error_banner)
+        lay.addWidget(dismiss, 0, Qt.AlignTop)
+
+        self._error_banner = frame
+        return frame
+
+    def show_error_banner(self, title: str, detail: str = "") -> None:
+        """Pin a failure message above the controls that caused it."""
+        self._error_title.setText(title)
+        self._error_detail.setText(detail)
+        self._error_detail.setVisible(bool(detail))
+        self._error_banner.setVisible(True)
+
+    def clear_error_banner(self) -> None:
+        """Hide the failure banner (also called when a new run starts)."""
+        self._error_banner.setVisible(False)
+        self._error_title.setText("")
+        self._error_detail.setText("")
 
     def _build_image_group(self) -> QWidget:
         box = QGroupBox("1 · Image")
@@ -493,6 +548,9 @@ class DesignPanel(QWidget):
         self._cancel_btn.setVisible(generating)
         if generating:
             self._progress.setValue(0)
+            # A retry starts clean: the previous failure has been acted on, and
+            # leaving a stale message beside live progress is misleading.
+            self.clear_error_banner()
 
     def set_progress(self, stage: str, fraction: float) -> None:
         self._progress.setValue(int(fraction * 100))

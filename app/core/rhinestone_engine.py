@@ -60,6 +60,15 @@ class GenerationResult:
     def total_before_limit(self) -> int:
         return self.placement.total_before_limit
 
+    @property
+    def regions(self) -> np.ndarray | None:
+        """The region map the engine judged (see :attr:`PlacementResult.regions`).
+
+        Only :data:`~app.models.settings.PlacementMode.AUTOMATIC` produces one;
+        it backs the UI's "Fill Areas" overlay. ``None`` in every other mode.
+        """
+        return self.placement.regions
+
 
 def density_params_from_settings(
     settings: GenerationSettings, *, invert: bool | None = None
@@ -142,7 +151,7 @@ def generate(
         invert is None
         and not settings.invert_tone
         and not settings.invert_areas
-        and settings.placement_mode is PlacementMode.OUTLINE
+        and settings.placement_mode in (PlacementMode.OUTLINE, PlacementMode.AUTOMATIC)
         and field.backdrop is not None
     ):
         on_backdrop = field.backdrop > 0.5

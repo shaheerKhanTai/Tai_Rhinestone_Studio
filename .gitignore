@@ -18,6 +18,9 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+tests/
+test_output/
+acceptance_test.py
 
 # IDE
 .vscode/
@@ -30,3 +33,4 @@ htmlcov/
 # OS
 Thumbs.db
 Desktop.ini
+test_workflow.py

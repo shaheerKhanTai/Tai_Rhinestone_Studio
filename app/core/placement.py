@@ -3,8 +3,14 @@
 Given a density map (Phase 2), a :class:`~app.core.geometry.DesignTransform`
 mapping density pixels to physical millimetres, and the
 :class:`~app.models.settings.GenerationSettings`, this module produces stone
-centre positions (mm) for four layouts:
+centre positions (mm) for six layouts:
 
+* **automatic** — the default. Reads the artwork, splits it into flat shapes
+  and tonal (photographic) regions, and gives each the treatment it needs:
+  a traced contour row plus hexagonal fill for the flat parts, a
+  density-following scatter for the shaded ones;
+* **outline** — the shape treatment applied to the whole design: an even row
+  of stones along every contour plus a lattice interior fill;
 * **grid** — regular rows and columns at the stone pitch;
 * **offset / brick** — alternate rows shifted by half a pitch;
 * **hexagonal** — densest valid packing (rows shifted, vertical pitch √3/2·p);
@@ -21,10 +27,11 @@ Two hard guarantees:
   a pitch of margin from the artboard edge, so no stone is clipped by the
   canvas boundary in any mode.
 
-Tonal reproduction uses an 8×8 ordered-dither (Bayer) matrix: a stone is placed
-at a lattice cell when the local density exceeds the cell's dither threshold, so
-coverage is approximately proportional to density (a clean halftone). Solid-dark
-regions fill completely; midtones render as a graceful stipple.
+The dithered modes (grid, offset, hexagonal, organic) reproduce tone with an
+8×8 ordered-dither (Bayer) matrix: a stone is placed at a lattice cell when the
+local density exceeds the cell's dither threshold, so coverage is approximately
+proportional to density (a clean halftone). Solid-dark regions fill completely;
+midtones render as a graceful stipple.
 """
 from __future__ import annotations
 
@@ -83,6 +90,12 @@ class PlacementResult:
     densities: np.ndarray     # (N,) float64 density sampled at each position
     total_before_limit: int   # candidates before the max-stone cap was applied
     pitch_mm: float           # centre-to-centre spacing used
+    #: Which kind of region each stone came from, as an ``(H, W)`` uint8 map
+    #: over the density grid: 0 empty, 1 outline, 2 solid fill, 3 tonal
+    #: (scattered). Only :data:`PlacementMode.AUTOMATIC` produces one — it is
+    #: what the engine judged, and the UI draws it as the "Fill Areas" overlay.
+    #: ``None`` for every other mode, which apply one treatment everywhere.
+    regions: np.ndarray | None = None
 
     @property
     def count(self) -> int:
@@ -214,6 +227,169 @@ _DETAIL_HOLE_MAX = 0.60
 #: the mask it came from — the trace gate is inset by that much before the
 #: contour is cut along it.
 _CONTOUR_EPS_PX = 2.0
+
+# -- Automatic mode: region labels and the thresholds that decide them -------- #
+
+#: Region labels written into :attr:`PlacementResult.regions`. ``NONE`` is
+#: empty canvas (and the transparent surround); the rest name the treatment the
+#: engine chose for that pixel.
+REGION_NONE = 0
+REGION_OUTLINE = 1
+REGION_SOLID = 2
+REGION_TONAL = 3
+
+#: Local density variation above which a region is *tonal* — a photograph, a
+#: gradient, or shaded artwork — rather than a flat logo. Measured as the
+#: local standard deviation of the density over a two-pitch window, so it
+#: scales with the design rather than with the analysis resolution. Below the
+#: threshold a region is flat enough that the crisp outline + lattice
+#: treatment is what the user is expecting.
+_AUTO_TONAL_VARIATION = 0.10
+
+#: Share of the shape that must be tonal before an *opaque* image counts as a
+#: photograph outright. A photograph has no meaningful outline to trace, so
+#: drawing a contour row around whatever Otsu happened to split would impose a
+#: hard ring the image does not have; above this share the shape is scattered
+#: instead. Artwork that declares its own silhouette (a transparent PNG/SVG)
+#: is never treated this way — its edge is exact, so it is always traced.
+#:
+#: The value sits in the measured gap between the two populations. Across flat,
+#: anti-aliased, drop-shadowed, thick-shaded and gradient-filled logos exported
+#: on a light backdrop, the share lands at 0.16–0.22 (the floor is the artwork's
+#: own soft edge, not shading); across a smooth gradient, a noisy and a busy
+#: photograph it lands at 0.38–0.88. 0.30 clears both by a comfortable margin.
+_AUTO_PHOTO_SHARE = 0.30
+
+#: Density assigned to fill stones so the outline row always wins a tie when
+#: the greedy filter has to drop one of a too-close pair.
+_AUTO_FILL_DENSITY = 0.9
+
+#: Width of the variation window in stone pitches. One pitch is too narrow to
+#: see a broad gradient (a smooth ramp is locally flat at stone scale), while a
+#: much wider window starts blending across a design's own internal edges.
+_AUTO_VARIATION_PITCHES = 2.0
+
+
+def _pitch_px(transform: DesignTransform, pitch: float) -> float:
+    """Stone pitch expressed in density-map pixels (conservative axis)."""
+    scale = min(transform.scale_x, transform.scale_y)  # mm per px
+    return pitch / max(scale, 1e-9)
+
+
+def solid_shape(
+    density: np.ndarray,
+    shape: np.ndarray | None,
+    clip: np.ndarray | None,
+    pitch_px: float,
+) -> np.ndarray:
+    """The artwork's solid shapes as a 0/255 mask — shared by the shape modes.
+
+    This is steps 1–3 of the shape-driven treatment:
+
+    1. take the artwork's solid shapes — its exact silhouette when the image
+       declares one (transparent PNG/SVG), otherwise an Otsu split of the tone
+       field (opaque artwork);
+    2. clip to the traced region when there is one;
+    3. smooth the pixel boundary so outline rows glide around curves instead of
+       staircasing.
+
+    Returns an all-zero mask when nothing survives, which callers treat as
+    "no stones".
+    """
+    if shape is not None:
+        bw = _shape_from_silhouette(density, shape, pitch_px)
+    else:
+        bw = _shape_from_density(density, pitch_px)
+    if clip is not None:
+        bw = np.where(clip > 0, bw, 0).astype(np.uint8)
+    if not bw.any():
+        return bw
+
+    blur = cv2.GaussianBlur(bw, (0, 0), sigmaX=1.0)
+    return np.where(blur >= 128, 255, 0).astype(np.uint8)
+
+
+def _contour_row(bw: np.ndarray, pitch_px: float) -> np.ndarray:
+    """Stones at equal arc spacing along every contour of ``bw`` (px coords).
+
+    Chord distances between arc-spaced points run slightly short of the arc
+    (corner-cutting at polygon vertices, curvature); the 5% margin keeps every
+    consecutive pair at or above the true pitch so the greedy safety filter
+    below never has to drop a stone on a smooth contour.
+
+    Returns an ``(M, 2)`` float64 array, empty when the mask has no contour
+    long enough to hold a stone.
+    """
+    contours, _hierarchy = cv2.findContours(bw, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    rows: list[np.ndarray] = []
+    for contour in contours:
+        if contour.shape[0] < 3:
+            continue
+        poly = cv2.approxPolyDP(contour, _CONTOUR_EPS_PX, True).reshape(-1, 2).astype(np.float64)
+        if poly.shape[0] < 3:
+            continue
+        length_px = float(cv2.arcLength(poly.astype(np.float32), True))
+        if length_px < 0.5 * pitch_px:
+            continue
+        if length_px < 1.5 * pitch_px:
+            # A tiny blob: one stone at its centre.
+            m = cv2.moments(contour)
+            if m["m00"] > 0:
+                rows.append(np.array([[m["m10"] / m["m00"], m["m01"] / m["m00"]]]))
+            continue
+        n = max(1, int(math.floor(length_px / (pitch_px * 1.05))))
+        rows.append(_resample_closed_path(poly, n))
+    if not rows:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.vstack(rows).reshape(-1, 2)
+
+
+def _distance_inside(bw: np.ndarray) -> np.ndarray:
+    """Distance (px) from each inside pixel of ``bw`` to the nearest edge.
+
+    The mask is zero-padded first — a full-bleed shape has no background
+    pixels, and without the pad the transform would not inset from the
+    artboard edge, leaving the fill flush against the canvas border.
+    """
+    padded = cv2.copyMakeBorder(bw, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    return cv2.distanceTransform(padded, cv2.DIST_L2, 5)[1:-1, 1:-1]
+
+
+def _interior_fill(
+    bw: np.ndarray,
+    dist: np.ndarray,
+    transform: DesignTransform,
+    pitch: float,
+    pitch_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hex-lattice stones filling everywhere at least one pitch inside ``bw``.
+
+    ``dist`` is :func:`_distance_inside` for the same mask, passed in so the
+    caller can reuse it for the region map rather than transforming twice.
+
+    Returns ``(positions_mm (K, 2), pixel_indices (K, 2))`` — the pixel indices
+    let a caller label each fill stone with the region it landed in. Both are
+    empty when the shape is too thin to hold a fill stone.
+    """
+    h, w = bw.shape
+    fill_region = dist >= pitch_px
+    if not fill_region.any():
+        return np.empty((0, 2)), np.empty((0, 2), dtype=np.int64)
+
+    vpitch = pitch * math.sqrt(3.0) / 2.0
+    fx, fy, _ci, _ri = _lattice(
+        transform.design_width_mm, transform.design_height_mm,
+        pitch, vpitch, stagger=True, inset=pitch / 2.0,
+    )
+    if fx.size == 0:
+        return np.empty((0, 2)), np.empty((0, 2), dtype=np.int64)
+
+    ix = np.clip(np.round(fx / transform.scale_x).astype(np.int64), 0, w - 1)
+    iy = np.clip(np.round(fy / transform.scale_y).astype(np.int64), 0, h - 1)
+    keep = fill_region[iy, ix]
+    positions = np.column_stack([fx[keep], fy[keep]])
+    pixels = np.column_stack([iy[keep], ix[keep]])
+    return positions, pixels
 
 
 def _detail_keep_map(
@@ -739,55 +915,15 @@ def _place_outline(
 
     Deterministic throughout.
     """
-    h, w = density.shape
-    scale = min(transform.scale_x, transform.scale_y)  # mm per px, conservative
-    pitch_px = pitch / max(scale, 1e-9)
+    pitch_px = _pitch_px(transform, pitch)
 
-    # -- 1-2. Solid shape mask ------------------------------------------------ #
-    if shape is not None:
-        bw = _shape_from_silhouette(density, shape, pitch_px)
-    else:
-        bw = _shape_from_density(density, pitch_px)
-    if clip is not None:
-        bw = np.where(clip > 0, bw, 0).astype(np.uint8)
+    # -- 1-3. Solid shape mask, clipped, boundary smoothed --------------------- #
+    bw = solid_shape(density, shape, clip, pitch_px)
     if not bw.any():
         return np.empty((0, 2)), np.empty((0,))
 
-    # -- 3. Boundary smoothing (round the pixel staircase) --------------------- #
-    blur = cv2.GaussianBlur(bw, (0, 0), sigmaX=1.0)
-    bw = np.where(blur >= 128, 255, 0).astype(np.uint8)
-    if not bw.any():
-        return np.empty((0, 2)), np.empty((0,))
-
-    # -- 4. Outline stones on every contour ------------------------------------- #
-    # Chord distances between arc-spaced points run slightly short of the arc
-    # (corner-cutting at polygon vertices, curvature); the 5% margin keeps
-    # every consecutive pair at or above the true pitch so the greedy safety
-    # filter below never has to drop a stone on a smooth contour.
-    contours, _hierarchy = cv2.findContours(bw, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    outline_px: list[np.ndarray] = []
-    for contour in contours:
-        if contour.shape[0] < 3:
-            continue
-        poly = cv2.approxPolyDP(contour, _CONTOUR_EPS_PX, True).reshape(-1, 2).astype(np.float64)
-        if poly.shape[0] < 3:
-            continue
-        length_px = float(cv2.arcLength(poly.astype(np.float32), True))
-        if length_px < 0.5 * pitch_px:
-            continue
-        if length_px < 1.5 * pitch_px:
-            # A tiny blob: one stone at its centre.
-            m = cv2.moments(contour)
-            if m["m00"] > 0:
-                outline_px.append(np.array([[[m["m10"] / m["m00"], m["m01"] / m["m00"]]]]))
-            continue
-        n = max(1, int(math.floor(length_px / (pitch_px * 1.05))))
-        outline_px.append(_resample_closed_path(poly, n))
-
-    if outline_px:
-        outline_pts_px = np.vstack(outline_px)
-    else:
-        outline_pts_px = np.empty((0, 2))
+    # -- 4. Outline stones on every contour ------------------------------------ #
+    outline_pts_px = _contour_row(bw, pitch_px)
 
     # px → mm; clamp into the artboard with a half-pitch inset (a stone centred
     # exactly on the canvas edge would be half off the transfer). Collision
@@ -802,24 +938,12 @@ def _place_outline(
 
     # -- 5. Hex fill of the deep interior --------------------------------------- #
     # Candidates: hex lattice cells at least ~one pitch inside the shape (the
-    # exact inset is enforced below in mm). The mask is zero-padded first — a
-    # full-bleed shape has no background pixels, and without the pad the
-    # distance transform would not inset the fill from the artboard edge.
-    bw_padded = cv2.copyMakeBorder(bw, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-    dist = cv2.distanceTransform(bw_padded, cv2.DIST_L2, 5)[1:-1, 1:-1]
-    fill_region = dist >= pitch_px
-    if fill_region.any():
-        vpitch = pitch * math.sqrt(3.0) / 2.0
-        fx, fy, _ci, _ri = _lattice(
-            transform.design_width_mm, transform.design_height_mm,
-            pitch, vpitch, stagger=True, inset=pitch / 2.0,
-        )
-        if fx.size:
-            ix = np.clip(np.round(fx / transform.scale_x).astype(np.int64), 0, w - 1)
-            iy = np.clip(np.round(fy / transform.scale_y).astype(np.int64), 0, h - 1)
-            keep = fill_region[iy, ix]
-            positions = np.vstack([positions, np.column_stack([fx[keep], fy[keep]])])
-            dens = np.concatenate([dens, np.full(int(keep.sum()), 0.85)])
+    # exact inset is enforced below in mm).
+    dist = _distance_inside(bw)
+    fill_positions, _fill_pixels = _interior_fill(bw, dist, transform, pitch, pitch_px)
+    if fill_positions.shape[0]:
+        positions = np.vstack([positions, fill_positions])
+        dens = np.concatenate([dens, np.full(fill_positions.shape[0], 0.85)])
 
     # -- 6. Collision filter: outline stones in path order first, then fill -- #
     # A neck narrower than the pitch between contour walls, or a fill row that
@@ -832,6 +956,190 @@ def _place_outline(
         dens = dens[accepted]
 
     return positions, dens
+
+
+def _local_variation(density: np.ndarray, pitch_px: float) -> np.ndarray:
+    """Local standard deviation of the density over a stone-pitch window.
+
+    This is the *judge* in Automatic mode: a flat logo holds a nearly constant
+    density across a stone's width, while a photograph, a gradient or shaded
+    artwork swings between light and dark within the same span. Measured on the
+    density (not on raw luminance) so it follows whatever the tone pipeline —
+    including an inverted or area-inverted one — decided the subject is.
+    """
+    ksize = int(round(max(3.0, pitch_px * _AUTO_VARIATION_PITCHES)))
+    if ksize % 2 == 0:
+        ksize += 1
+    # No upper cap on ``ksize``: ``cv2.boxFilter`` runs off running sums, so
+    # its cost is independent of the kernel width. Capping it would silently
+    # break the resolution-independence of the measurement (a high-resolution
+    # analysis has a proportionally larger pitch in pixels).
+    src = density.astype(np.float32)
+    mean = cv2.boxFilter(src, ddepth=-1, ksize=(ksize, ksize), normalize=True)
+    mean_sq = cv2.boxFilter(src * src, ddepth=-1, ksize=(ksize, ksize), normalize=True)
+    return np.sqrt(np.clip(mean_sq - mean * mean, 0.0, None)).astype(np.float32)
+
+
+def _place_auto(
+    density: np.ndarray,
+    transform: DesignTransform,
+    pitch: float,
+    shape: np.ndarray | None = None,
+    clip: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Automatic: judge the artwork, then give each region what it needs.
+
+    This is the mode the engine chooses for the user. Instead of dithering the
+    whole design (which turns a flat logo into speckle) or tracing the whole
+    design (which posterises a photograph), it splits the artwork into regions
+    and applies the treatment each one calls for:
+
+    * **outline** — an even row of stones traced along the shape's contours,
+      the crisp edge every rhinestone design is read by;
+    * **solid** — flat regions inside that contour (a logo's body, a letter
+      stem) take the regular hexagonal fill, so they read as a solid field;
+    * **tonal** — regions whose density swings within a stone's width (a
+      photograph, a gradient, shading) are **scattered**: a jittered lattice
+      filtered against the density itself, so the stone field follows the
+      image's own light and shade rather than being posterised into blobs.
+
+    A shape that is *mostly* tonal is a photograph, and drawing a contour row
+    around a photograph would impose a hard ring the image does not have, so in
+    that case the outline row is skipped and the whole shape is scattered.
+
+    All three candidate sets then pass through **one** greedy minimum-distance
+    filter in exact millimetres, outline first and tonal in descending density,
+    so the pitch is guaranteed across region boundaries and never only within
+    one of them.
+
+    Returns ``(positions_mm, densities, regions)`` where ``regions`` is the
+    ``(H, W)`` uint8 map of what was decided for each pixel — the data behind
+    the UI's "Fill Areas" overlay. Deterministic throughout.
+    """
+    h, w = density.shape
+    pitch_px = _pitch_px(transform, pitch)
+    regions = np.zeros((h, w), dtype=np.uint8)
+
+    bw = solid_shape(density, shape, clip, pitch_px)
+    if not bw.any():
+        return np.empty((0, 2)), np.empty((0,)), regions
+
+    inside = bw > 0
+    dist = _distance_inside(bw)
+
+    # -- Judge: which parts of the shape are tonal, which are solid ----------- #
+    # Measured away from the shape's own boundary: the density always swings
+    # there (it steps from nothing outside to artwork inside), so an edge
+    # always looks "tonal" to a local-variation test. The boundary is the
+    # outline row's business, not the tonal/solid split's, and excluding it
+    # keeps the interior classification about the artwork rather than about its
+    # own silhouette.
+    variation = _local_variation(density, pitch_px)
+    interior = dist > 0.5 * pitch_px
+    tonal = inside & interior & (variation > _AUTO_TONAL_VARIATION)
+    tonal_share = float(np.count_nonzero(tonal)) / float(np.count_nonzero(inside & interior)) \
+        if np.any(inside & interior) else 0.0
+
+    # -- The region map: the *areas* the engine judged ----------------------- #
+    # Areas, deliberately, not the individual stone positions: a few hundred
+    # flagged pixels spread across a whole design are invisible once the map is
+    # scaled onto the artboard, which would make the overlay useless at exactly
+    # the zoom levels where it is most wanted. Each label covers the region the
+    # corresponding treatment applies to, and every one is confined to the
+    # shape — the transparent surround is never a fill area.
+    solid_area = inside & ~tonal & (dist >= pitch_px)
+    regions[solid_area] = REGION_SOLID
+    regions[inside & tonal] = REGION_TONAL
+
+    # Only an *opaque* image can be mistaken for a photograph here: opaque
+    # artwork has no declared silhouette, so the shape came from an Otsu split
+    # of the tone field and a traced contour would ring whatever that split
+    # happened to find. Artwork carrying transparency states its own outline
+    # exactly, so that outline is always traced — it is the user's real edge.
+    photographic = shape is None and tonal_share > _AUTO_PHOTO_SHARE
+
+    blocks: list[np.ndarray] = []
+    dens_blocks: list[np.ndarray] = []
+
+    # -- 1. Outline row (skipped for a photograph) ---------------------------- #
+    if not photographic:
+        outline_pts_px = _contour_row(bw, pitch_px)
+        if outline_pts_px.shape[0]:
+            positions = transform.image_to_design_array(outline_pts_px)
+            inset = min(pitch / 2.0, transform.design_width_mm / 2.0,
+                        transform.design_height_mm / 2.0)
+            positions[:, 0] = np.clip(positions[:, 0], inset, transform.design_width_mm - inset)
+            positions[:, 1] = np.clip(positions[:, 1], inset, transform.design_height_mm - inset)
+            blocks.append(positions)
+            dens_blocks.append(np.full(positions.shape[0], 1.0))
+        # The band the row runs along: everything inside the shape within half
+        # a pitch of its edge, expressed with the distance transform so it is
+        # exactly the strip the outline stones occupy. Drawing the contour
+        # instead would centre the stroke on the boundary and spill half of it
+        # onto the transparent surround, marking an area that can never be
+        # filled. Set last, after the interior labels, so the edge reads as the
+        # outline's own region.
+        regions[inside & (dist <= 0.5 * pitch_px)] = REGION_OUTLINE
+
+    # -- 2. Solid interior: the crisp hexagonal fill --------------------------- #
+    fill_positions, fill_pixels = _interior_fill(bw, dist, transform, pitch, pitch_px)
+    if fill_positions.shape[0]:
+        solid = ~tonal[fill_pixels[:, 0], fill_pixels[:, 1]]
+        if solid.any():
+            sp = fill_positions[solid]
+            blocks.append(sp)
+            dens_blocks.append(np.full(sp.shape[0], _AUTO_FILL_DENSITY))
+
+    # -- 3. Tonal interior: the density-following scatter ---------------------- #
+    if tonal.any():
+        vpitch = pitch * math.sqrt(3.0) / 2.0
+        tx, ty, tci, tri = _lattice(
+            transform.design_width_mm, transform.design_height_mm,
+            pitch, vpitch, stagger=True, inset=pitch / 2.0,
+        )
+        if tx.size:
+            # Jitter so the scatter reads as irregular rather than as another
+            # lattice — deterministic, from the coordinate hash (no RNG state).
+            jitter = 0.35 * pitch
+            tx = tx + (_hash01(tci, tri, salt=3) - 0.5) * 2.0 * jitter
+            ty = ty + (_hash01(tci, tri, salt=4) - 0.5) * 2.0 * jitter
+            inset = min(pitch / 2.0, transform.design_width_mm / 2.0,
+                        transform.design_height_mm / 2.0)
+            tx = np.clip(tx, inset, transform.design_width_mm - inset)
+            ty = np.clip(ty, inset, transform.design_height_mm - inset)
+            tix = np.clip(np.round(tx / transform.scale_x).astype(np.int64), 0, w - 1)
+            tiy = np.clip(np.round(ty / transform.scale_y).astype(np.int64), 0, h - 1)
+            # Only inside the tonal region, and halftone-filtered against the
+            # density so light areas thin out and dark areas fill.
+            in_tonal = tonal[tiy, tix]
+            sampled = density[tiy, tix]
+            keep = in_tonal & (sampled > _bayer_at(tci, tri))
+            if keep.any():
+                tp = np.column_stack([tx[keep], ty[keep]])
+                # Descending density inside the group, so the darkest detail
+                # keeps its stones when the greedy filter has to drop some.
+                order = np.lexsort((np.arange(tp.shape[0]), -sampled[keep]))
+                blocks.append(tp[order])
+                dens_blocks.append(sampled[keep][order])
+
+    if not blocks:
+        return np.empty((0, 2)), np.empty((0,)), regions
+
+    positions = np.vstack(blocks)
+    dens = np.concatenate(dens_blocks)
+
+    # -- One greedy pass over everything, in the priority order above ---------- #
+    # A single filter (rather than one per region) is what guarantees the pitch
+    # *across* region boundaries: a tonal stone may never land a hair under the
+    # pitch from a solid one, and the outline row can never be thinned by the
+    # fill, because it is accepted first.
+    if positions.shape[0] > 1:
+        order = np.arange(positions.shape[0])
+        accepted = _greedy_min_distance(positions[:, 0], positions[:, 1], order, pitch)
+        positions = positions[accepted]
+        dens = dens[accepted]
+
+    return positions, dens, regions
 
 
 # --------------------------------------------------------------------------- #
@@ -927,7 +1235,15 @@ def place_stones(
     _check_cancel(is_cancelled)
 
     mode = settings.placement_mode
-    if mode is PlacementMode.OUTLINE:
+    regions: np.ndarray | None = None
+    if mode is PlacementMode.AUTOMATIC:
+        # Region-aware: contour row + solid lattice fill + density-following
+        # scatter, judged from the image. Emits the region map the UI draws.
+        clip = _gate_reach(gate) if gate is not None else None
+        positions, densities, regions = _place_auto(density, transform, pitch,
+                                                    shape=shape, clip=clip)
+        streamed = False
+    elif mode is PlacementMode.OUTLINE:
         # Contour tracing + lattice fill: no dithering, so the detail-keep
         # map does not apply.
         clip = _gate_reach(gate) if gate is not None else None
@@ -991,4 +1307,5 @@ def place_stones(
         densities=densities,
         total_before_limit=total_before_limit,
         pitch_mm=pitch,
+        regions=regions,
     )

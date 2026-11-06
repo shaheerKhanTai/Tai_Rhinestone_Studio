@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -17,11 +18,13 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +38,20 @@ from app.ui.widgets.wheel_safe import NoWheelComboBox, NoWheelSpinBox
 #: (Unit, label) shown in the default-units combo — mirrors the sidebar.
 _UNIT_ITEMS = [(Unit.INCH, "Inches (in)"), (Unit.MM, "Millimeters (mm)"), (Unit.CM, "Centimeters (cm)")]
 
+#: Smallest the dialog is allowed to get. Kept modest so it fits a small or
+#: heavily scaled laptop panel; on a roomy display the dialog opens larger (see
+#: :meth:`SettingsDialog._fit_to_screen`).
+_MIN_WIDTH = 520
+_MIN_HEIGHT = 360
+
+#: Share of the available screen the dialog may occupy when sizing itself.
+_SCREEN_FRACTION = 0.9
+
+#: Screen width at (and above) which the groups are laid out in two columns.
+#: Below it the columns would be too narrow for the form rows to read, so the
+#: groups stack and the dialog scrolls instead.
+_TWO_COLUMN_MIN_WIDTH = 860
+
 
 class SettingsDialog(QDialog):
     """A grouped preferences dialog over :class:`AppSettings`."""
@@ -45,7 +62,20 @@ class SettingsDialog(QDialog):
         self._source = settings
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.setMinimumWidth(480)
+
+        # Lay the groups out in two columns when the display is wide enough.
+        # Stacked in one column this dialog is ~940 px tall, which does not fit
+        # a 768-px-tall laptop panel at all — the user would be scrolling for
+        # options that have plenty of room to sit side by side. Two columns
+        # roughly halve the height, so on a normal display every option is
+        # visible at once, which is the point of the dialog.
+        screen = self._target_screen()
+        available = screen.availableGeometry() if screen is not None else None
+        two_columns = available is not None and available.width() >= _TWO_COLUMN_MIN_WIDTH
+
+        # Width is settled in :meth:`_fit_to_screen`, which measures the content
+        # it just built; only the height floor is fixed up front.
+        self.setMinimumHeight(_MIN_HEIGHT)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18)
@@ -55,13 +85,44 @@ class SettingsDialog(QDialog):
         title.setProperty("role", "subheading")
         root.addWidget(title)
 
-        root.addWidget(self._build_appearance_group())
-        root.addWidget(self._build_defaults_group())
-        root.addWidget(self._build_autosave_group())
-        root.addWidget(self._build_canvas_group())
-        root.addWidget(self._build_performance_group())
-        root.addWidget(self._build_confirmations_group())
-        root.addStretch(1)
+        # The groups live inside a scroll area, while the title and the button
+        # box stay outside it as fixed rows. That is what guarantees OK / Cancel
+        # are always reachable: however short the display, the worst case is a
+        # scrollbar through the settings rather than controls pushed silently
+        # off the bottom edge with no way to get to them.
+        groups = [
+            self._build_appearance_group(),
+            self._build_defaults_group(),
+            self._build_autosave_group(),
+            self._build_canvas_group(),
+            self._build_performance_group(),
+            self._build_confirmations_group(),
+        ]
+
+        content = QWidget()
+        if two_columns:
+            grid = QGridLayout(content)
+            grid.setContentsMargins(0, 0, 8, 0)  # room for the scrollbar
+            grid.setSpacing(12)
+            grid.setHorizontalSpacing(14)
+            for i, group in enumerate(groups):
+                grid.addWidget(group, i // 2, i % 2, Qt.AlignTop)
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
+        else:
+            column = QVBoxLayout(content)
+            column.setContentsMargins(0, 0, 8, 0)
+            column.setSpacing(14)
+            for group in groups:
+                column.addWidget(group)
+            column.addStretch(1)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(content)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        root.addWidget(self._scroll, 1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.RestoreDefaults | QDialogButtonBox.Ok | QDialogButtonBox.Cancel
@@ -73,6 +134,58 @@ class SettingsDialog(QDialog):
         root.addWidget(buttons)
 
         self._load_from(settings)
+        self._fit_to_screen()
+
+    def _target_screen(self):
+        """The screen this dialog will open on (its parent's, else the primary)."""
+        parent = self.parentWidget()
+        if parent is not None:
+            screen = parent.screen()
+            if screen is not None:
+                return screen
+        return QGuiApplication.primaryScreen()
+
+    def _fit_to_screen(self) -> None:
+        """Size the dialog to its content, capped to the screen it will open on.
+
+        A fixed geometry cannot work here: the same dialog is opened on desktop
+        monitors and on small, heavily scaled laptop panels, and the group boxes
+        grow with the system font. Sizing to the content and clamping to the
+        available screen keeps every option visible where there is room, and
+        falls back on the scroll area where there is not.
+        """
+        screen = self._target_screen()
+        available = screen.availableGeometry() if screen is not None else None
+        max_w = int(available.width() * _SCREEN_FRACTION) if available else 10 ** 6
+        max_h = int(available.height() * _SCREEN_FRACTION) if available else 10 ** 6
+
+        hint = self.sizeHint()
+        width, height = hint.width(), hint.height()
+
+        # A scroll area's own size hint is deliberately modest — it never asks
+        # for enough room to show all of its content, because that is the whole
+        # point of scrolling. Left at that, the dialog would open showing only
+        # the first few groups on a display with plenty of room for every one of
+        # them. So ask the *content* what it needs and add back everything that
+        # is not the scroller (title, spacing, button row, margins) — measured
+        # from the hint rather than hardcoded, so it stays correct if the
+        # dialog's chrome changes.
+        content = self._scroll.widget()
+        if content is not None:
+            chrome_h = hint.height() - self._scroll.sizeHint().height()
+            chrome_w = hint.width() - self._scroll.sizeHint().width()
+            height = max(height, content.sizeHint().height() + chrome_h)
+            # The content's own minimum width is the floor: sizing below it is
+            # exactly what introduces a horizontal scrollbar across the form
+            # rows, which is what makes a row of settings unreadable.
+            width = max(width, content.minimumSizeHint().width() + chrome_w)
+
+        # The minimum tracks the size we actually settled on, so the layout can
+        # never be squeezed narrower than the content it was measured for —
+        # except on a screen too small to honour it, where the cap wins and the
+        # scroll area takes over.
+        self.setMinimumWidth(min(max(_MIN_WIDTH, width), max_w))
+        self.resize(min(width, max_w), max(_MIN_HEIGHT, min(height, max_h)))
 
     # ------------------------------------------------------------------ #
     # Group construction
@@ -195,6 +308,9 @@ class SettingsDialog(QDialog):
 
     def _restore_defaults(self) -> None:
         self._load_from(AppSettings())
+        # Defaults can change which rows are enabled/visible, so re-fit rather
+        # than leaving the dialog sized for the previous state.
+        self._fit_to_screen()
 
     def result_settings(self) -> AppSettings:
         """Return a new :class:`AppSettings` reflecting the dialog's controls.

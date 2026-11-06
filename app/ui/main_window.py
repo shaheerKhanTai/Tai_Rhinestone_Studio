@@ -8,8 +8,10 @@ window owns the shell, menus, actions, theming and window-state persistence.
 """
 from __future__ import annotations
 
+import html
 import logging
 from pathlib import Path
+from typing import Sequence
 
 from PySide6.QtCore import QByteArray, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
@@ -36,6 +38,7 @@ from app.models.app_settings import AppSettings
 from app.models.project import Project
 from app.services import settings_service
 from app.services.logging_config import get_logger
+from app.ui.feedback import play_error_sound
 from app.ui.icons import make_app_icon, make_icon
 from app.ui.state import AppState
 from app.ui.theme import Theme, ThemeMode, build_qss, get_theme
@@ -48,6 +51,25 @@ _IMAGE_FILTER = (
 )
 _ORG = "Tai"
 _APP = "RhinestoneStudio"
+
+
+def _issue_sections_html(
+    causes: Sequence[str] | None, fixes: Sequence[str] | None
+) -> str:
+    """Render the "why" and "what to do" lists as rich-text HTML sections.
+
+    Kept as plain text lists inside the dialog rather than separate messages so
+    the cause and its fix stay together on screen — the whole point is that the
+    user can act on the message without having to remember the first half.
+    """
+    parts: list[str] = []
+    if causes:
+        items = "".join(f"<li>{html.escape(c)}</li>" for c in causes)
+        parts.append(f"<p><b>Why this happened</b></p><ul>{items}</ul>")
+    if fixes:
+        items = "".join(f"<li>{html.escape(f)}</li>" for f in fixes)
+        parts.append(f"<p><b>What to do</b></p><ul>{items}</ul>")
+    return "".join(parts)
 
 
 class MainWindow(QMainWindow):
@@ -216,6 +238,11 @@ class MainWindow(QMainWindow):
         self.act_show_grid = self._add_action("Show Grid", icon="grid",
                                               checkable=True, slot=self.action_toggle_grid)
         self.act_show_grid.setChecked(self.app_settings.show_grid)
+        self.act_show_fill_areas = self._add_action(
+            "Show Fill Areas", icon="grid", checkable=True,
+            tip="Tint the canvas with the areas the engine judged: green = outline, "
+                "blue = solid fill, amber = scatter",
+            slot=self.action_toggle_fill_areas)
         self.act_reset_layout = self._add_action("Reset Panel Layout", slot=self.action_reset_layout)
 
         # Theme actions (exclusive)
@@ -323,6 +350,7 @@ class MainWindow(QMainWindow):
         m_view.addSeparator()
         m_view.addAction(self.act_show_image)
         m_view.addAction(self.act_show_grid)
+        m_view.addAction(self.act_show_fill_areas)
         m_view.addSeparator()
         m_theme = m_view.addMenu("Theme")
         m_theme.addAction(self.act_theme_dark)
@@ -633,7 +661,15 @@ class MainWindow(QMainWindow):
         self._theme = theme
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(build_qss(theme))
+            qss = build_qss(theme)
+            # Setting an application stylesheet restyles *every* widget in the
+            # process, so re-applying an identical one is pure cost. This runs
+            # on every window construction, and windows can outlive each other
+            # briefly (a save/reopen, a second window), which turned the work
+            # quadratic in the number of windows ever created. The stylesheet
+            # only changes when the theme does, so compare before paying for it.
+            if app.styleSheet() != qss:
+                app.setStyleSheet(qss)
         # Retint action icons for the new palette.
         for act, icon_name in self._themed_actions:
             act.setIcon(make_icon(icon_name, theme.palette.text))
@@ -1171,6 +1207,28 @@ class MainWindow(QMainWindow):
         self._canvas.set_show_grid(checked)
         settings_service.save_settings(self.app_settings)
 
+    def action_toggle_fill_areas(self, checked: bool) -> None:
+        """Show/hide the overlay of the regions the engine judged."""
+        self._canvas.set_show_fill_areas(checked)
+        if checked and not self._canvas.has_fill_areas():
+            self.show_status_message(
+                "No judged areas yet — press Generate Design to analyse the image", 5000
+            )
+        else:
+            self._fill_areas_state_changed()
+            self.show_status_message(
+                "Fill areas: green = outline · blue = solid fill · amber = scatter"
+                if checked else "Fill areas hidden",
+                5000,
+            )
+
+    def _fill_areas_state_changed(self) -> None:
+        """Keep the Fill Areas action honest about what it can show."""
+        self.act_show_fill_areas.setEnabled(self._canvas.has_fill_areas())
+        if not self._canvas.has_fill_areas():
+            self.act_show_fill_areas.setChecked(False)
+            self._canvas.set_show_fill_areas(False)
+
     def action_select_all(self) -> None:
         self._canvas.select_all()
 
@@ -1192,11 +1250,33 @@ class MainWindow(QMainWindow):
         if self._active_worker is not None:
             return  # already running
         if not self.state.has_project or not self.state.has_image:
-            self.show_status_message("Import an image before generating", 4000)
+            self.show_error(
+                "Nothing to generate from",
+                "Import an image before generating a rhinestone design.",
+                causes=("No image is open in this project.",),
+                fixes=(
+                    "Use File ▸ Import Image (Ctrl+I) to open a PNG, JPG or SVG.",
+                    "Then press Generate Design (Ctrl+G).",
+                ),
+            )
             return
         from app.core.trace_mask import mask_is_empty
 
         if self.state.project.trace_mask is not None and mask_is_empty(self.state.project.trace_mask):
+            self.show_error(
+                "No rhinestones were generated",
+                "The traced area is empty, so Generate has nowhere to place stones. "
+                "Generate only fills the areas you paint with the Trace tool.",
+                causes=(
+                    "A trace exists on this design but no pixels were painted into it.",
+                ),
+                fixes=(
+                    "Paint the areas that should receive rhinestones with the Trace "
+                    "tool (T), then press Generate.",
+                    "Or use Design ▸ Clear Traced Area to remove the trace and generate "
+                    "from the whole image.",
+                ),
+            )
             self.show_status_message(
                 "The traced area is empty — paint it with the Trace tool "
                 "(T) or clear the trace to use the whole image", 6000
@@ -1264,6 +1344,27 @@ class MainWindow(QMainWindow):
         old_stones = list(proj.design.stones)
         proj.design.replace_all(result.stones)
 
+        # A run that placed nothing is a failure the user must not have to
+        # discover by staring at an empty canvas: explain it, in a dialog, with
+        # the error tone, and leave the explanation on screen beside the
+        # settings that caused it.
+        if result.stone_count == 0:
+            self._design_panel.set_generating(False)
+            self._canvas.end_stone_stream()
+            self._canvas.set_fill_areas(result.regions)
+            self._fill_areas_state_changed()
+            self._canvas.update()
+            self.set_status_count(0)
+            self._stats_panel.refresh()
+            # The dialog and the banner are the real report; the status bar
+            # keeps the one-line summary it has always shown, so the run does
+            # not leave a stale "Imported …" message sitting there.
+            self.show_status_message(
+                "Generated 0 stones — see the message in the Design panel for why", 6000
+            )
+            self.show_generation_issue(self._empty_generation_issue(result))
+            return
+
         # FEATURE 1 — a successful generation consumes the traced region: the
         # overlay and the project's mask are both cleared, so the next Generate
         # uses the whole image rather than silently re-using a stale gate. Only
@@ -1293,6 +1394,10 @@ class MainWindow(QMainWindow):
         self._design_panel.set_generating(False)
         # Replaces the streamed preview with the authoritative final stones.
         self._canvas.end_stone_stream()
+        # Show what the engine judged, so the placement is auditable rather
+        # than something the user has to infer from the stones.
+        self._canvas.set_fill_areas(result.regions)
+        self._fill_areas_state_changed()
         self._canvas.update()
         self.set_status_count(proj.design.stone_count)
         self._stats_panel.refresh()
@@ -1301,15 +1406,26 @@ class MainWindow(QMainWindow):
         self._update_action_states()
         self.show_status_message(self._generation_summary(result, cleared_trace), 6000)
 
+    def _empty_generation_issue(self, result):
+        """Diagnose a run that produced no stones (see core.diagnostics)."""
+        from app.core.diagnostics import diagnose_empty_generation
+
+        proj = self.state.project
+        return diagnose_empty_generation(
+            proj.settings,
+            result.density_field,
+            width_mm=proj.width_mm,
+            height_mm=proj.height_mm,
+            trace_mask=proj.trace_mask,
+        )
+
     def _generation_summary(self, result, cleared_trace: bool) -> str:
-        """User-facing summary of a finished generation pass."""
-        count = result.stone_count
-        if count == 0:
-            return (
-                "Generated 0 stones — nothing matched the current settings. "
-                "Try a higher Density, a lighter subject, or check the traced area."
-            )
-        msg = f"Generated {count:,} stones"
+        """User-facing summary of a finished generation pass.
+
+        A run that placed nothing never reaches here — it is diagnosed and
+        reported through :meth:`show_generation_issue` instead.
+        """
+        msg = f"Generated {result.stone_count:,} stones"
         if result.was_limited:
             msg += f" (limited from {result.total_before_limit:,})"
         if cleared_trace:
@@ -1328,13 +1444,16 @@ class MainWindow(QMainWindow):
         self.show_status_message("Generation cancelled", 4000)
 
     def _on_generation_failed(self, message: str) -> None:
+        from app.core.diagnostics import diagnose_failure
+
         self._active_worker = None
         self._design_panel.set_generating(False)
         self._canvas.end_stone_stream()
         self.set_status_count(
             self.state.project.design.stone_count if self.state.has_project else 0
         )
-        self.show_error("Generation failed", message)
+        mode = self.state.project.settings.placement_mode if self.state.has_project else None
+        self.show_generation_issue(diagnose_failure(message, placement_mode=mode))
 
     def action_resolve_collisions(self) -> None:
         from app.core.collision import detect_collisions, resolve_collisions
@@ -1401,6 +1520,9 @@ class MainWindow(QMainWindow):
         self._canvas.set_project(project)
         self._canvas.set_background_image(self._current_oriented_rgba())
         self._canvas.set_trace_mask(project.trace_mask)
+        # A freshly opened project carries no judged regions — the overlay is
+        # rebuilt from the next Generate.
+        self._canvas.set_fill_areas(None)
         self._canvas.set_design(project.design, fit=True)
         self._sync_canvas_stone_spec()
         # Bind the panels.
@@ -1460,6 +1582,8 @@ class MainWindow(QMainWindow):
             act.setEnabled(has_project)
         # Cropping needs an image to crop.
         self.act_tool_crop.setEnabled(has_image)
+        # The Fill Areas overlay needs a judged region map to show.
+        self.act_show_fill_areas.setEnabled(self._canvas.has_fill_areas())
         # Clearing needs a painted trace.
         self.act_clear_trace.setEnabled(self._canvas.has_trace())
         # Undo/redo reflect the command stack.
@@ -1489,12 +1613,48 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # Dialog helpers
     # ------------------------------------------------------------------ #
-    def show_error(self, title: str, message: str) -> None:
+    def show_error(
+        self,
+        title: str,
+        message: str,
+        *,
+        causes: Sequence[str] | None = None,
+        fixes: Sequence[str] | None = None,
+        sound: bool = True,
+    ) -> None:
+        """Report a failure: an error dialog, an error tone, and a sidebar banner.
+
+        ``causes`` and ``fixes`` are rendered as the "why it happened" and "what
+        to do" sections. They are optional so the many simple call sites (a file
+        that would not open, an export that failed) keep reading as one-liners,
+        while the generation paths can explain themselves properly.
+
+        The message is also left on screen in the Design panel's banner: a modal
+        dialog is dismissed and forgotten, but the reason a design did not
+        generate is something the user needs while they adjust the settings
+        that caused it.
+        """
+        if sound:
+            play_error_sound()
+
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
+        box.setIcon(QMessageBox.Critical)
         box.setWindowTitle(title)
-        box.setText(message)
+        box.setTextFormat(Qt.RichText)
+        box.setText(f"<b>{html.escape(title)}</b><p>{html.escape(message)}</p>"
+                    + _issue_sections_html(causes, fixes))
         box.exec()
+        self._design_panel.show_error_banner(title, message)
+
+    def show_generation_issue(self, issue) -> None:
+        """Render a :class:`~app.core.diagnostics.GenerationIssue` to the user."""
+        self.show_error(
+            issue.title,
+            issue.summary,
+            causes=issue.causes,
+            fixes=issue.fixes,
+            sound=issue.sound,
+        )
 
     def _confirm_discard_changes(self) -> bool:
         """Return True if it is safe to proceed (changes saved or discarded)."""

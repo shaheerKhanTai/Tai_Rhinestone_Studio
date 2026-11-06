@@ -251,6 +251,12 @@ class TestProperties:
         assert bool(np.all(mask[iy, ix] == 255))
         assert_no_overlaps(res, s)
 
-    def test_outline_is_the_default_mode(self):
-        assert GenerationSettings().placement_mode is PlacementMode.OUTLINE
+    def test_automatic_is_the_default_mode(self):
+        # The engine judges the artwork itself, so the user is not required to
+        # know whether their image is a logo or a photograph.
+        assert GenerationSettings().placement_mode is PlacementMode.AUTOMATIC
+        assert PlacementMode.AUTOMATIC.label == "Automatic (Smart)"
+
+    def test_outline_is_still_selectable(self):
+        assert PlacementMode.from_str("outline") is PlacementMode.OUTLINE
         assert PlacementMode.OUTLINE.label == "Outline + Fill"

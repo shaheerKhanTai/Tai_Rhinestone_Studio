@@ -28,6 +28,7 @@ PITCH = D + GAP
 RADIUS = D / 2.0
 
 ALL_MODES = [
+    PlacementMode.AUTOMATIC,
     PlacementMode.OUTLINE,
     PlacementMode.GRID,
     PlacementMode.OFFSET,

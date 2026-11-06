@@ -396,6 +396,33 @@ def build_qss(theme: Theme) -> str:
         "border-radius": f"{g.RADIUS_LG}px",
     }))
 
+    # Error banner (the persistent inline failure notice in the Design panel) --
+    # Addressed by object name rather than by descendant selectors
+    # (``QFrame[role="error"] QToolButton`` and friends). Qt matches descendant
+    # selectors by walking the ancestry of every widget whenever the sheet is
+    # applied, and this sheet is re-applied to the whole application on every
+    # theme change; ID selectors are a direct lookup. Same appearance, without
+    # the per-widget cost.
+    rules.append(_rule("QFrame#errorBanner", {
+        "background-color": rgba(p.error, 0.14 if p.is_dark else 0.08),
+        "border": f"1px solid {rgba(p.error, 0.55)}",
+        "border-radius": f"{g.RADIUS_MD}px",
+    }))
+    rules.append(_rule("QLabel#errorBannerTitle", {
+        "color": p.error, "font-weight": "600", "background": "transparent",
+    }))
+    rules.append(_rule("QLabel#errorBannerDetail", {
+        "color": mix(p.error, p.text, 0.45), "background": "transparent",
+        "font-size": f"{t.CAPTION}px",
+    }))
+    rules.append(_rule("QToolButton#errorBannerClose", {
+        "color": p.error, "font-weight": "600", "padding": "0px 4px",
+        "min-width": "16px", "min-height": "16px",
+    }))
+    rules.append(_rule("QToolButton#errorBannerClose:hover", {
+        "background-color": rgba(p.error, 0.22), "border-color": "transparent",
+    }))
+
     # Menu bar / menus ------------------------------------------------------
     rules.append(_rule("QMenuBar", {
         "background-color": p.surface, "color": p.text,

@@ -226,7 +226,9 @@ class TestTraceKeptWhenNothingIsPlaced:
         paint_band(canvas, proj, 30.0, proj.height_mm / 2, 8.0)
         traced = proj.trace_mask.copy()
 
-        monkeypatch.setattr(window, "show_error", lambda t, m: None)
+        # A failure is reported through the error dialog (which also carries the
+        # cause and the suggested fixes); this test is about the trace only.
+        monkeypatch.setattr(window, "show_error", lambda *a, **k: None)
         window._on_generation_failed("boom")
 
         assert proj.trace_mask is not None

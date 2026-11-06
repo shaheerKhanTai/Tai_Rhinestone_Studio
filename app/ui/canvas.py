@@ -44,6 +44,7 @@ from app.core.history import (
     PaintTraceCommand,
     SetTraceMaskCommand,
 )
+from app.core.placement import REGION_OUTLINE, REGION_SOLID, REGION_TONAL
 from app.core.trace_mask import (
     blank_mask,
     paint_stroke as paint_mask_stroke,
@@ -183,6 +184,13 @@ class CanvasView(QWidget):
         self._trace_changed = False
         self._trace_hover_mm: QPointF | None = None
 
+        # "Fill Areas" overlay: the region map the Automatic placement mode
+        # judged (0 empty, 1 outline, 2 solid fill, 3 tonal/scattered). Read-only
+        # — it visualises a past generation and never feeds back into placement.
+        self._region_map: np.ndarray | None = None
+        self._region_pixmap: QPixmap | None = None
+        self._show_fill_areas = False
+
         # AI suggestion preview (Issue 6): ghost stones for proposed adds and
         # arrows for proposed moves, drawn above everything else.
         self._ai_preview_adds: np.ndarray = np.empty((0, 2), dtype=np.float64)
@@ -200,6 +208,9 @@ class CanvasView(QWidget):
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
         self._stamp_cache.clear()
+        # Overlay colours are palette-derived, so they must be rebuilt.
+        self._trace_pixmap = None
+        self._region_pixmap = None
         self.update()
 
     def set_unit(self, unit: Unit) -> None:
@@ -481,6 +492,68 @@ class CanvasView(QWidget):
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(c, r, r)
+
+    # ------------------------------------------------------------------ #
+    # "Fill Areas" overlay — what the Automatic engine judged
+    # ------------------------------------------------------------------ #
+    def set_fill_areas(self, regions: np.ndarray | None) -> None:
+        """Show the region map a generation judged, or ``None`` to clear it.
+
+        ``regions`` is the ``(H, W)`` uint8 map from
+        :attr:`~app.core.placement.PlacementResult.regions`. The canvas converts
+        it to a coloured overlay itself so the colours come from the current
+        theme and re-tint with it, exactly like the trace overlay.
+        """
+        self._region_map = None if regions is None else np.asarray(regions, dtype=np.uint8)
+        self._region_pixmap = None
+        self.update()
+
+    def has_fill_areas(self) -> bool:
+        """True when a judged region map is available to show."""
+        return self._region_map is not None and bool(np.any(self._region_map))
+
+    def set_show_fill_areas(self, show: bool) -> None:
+        self._show_fill_areas = bool(show)
+        self.update()
+
+    def _paint_fill_areas(self, painter: QPainter, art: QRectF) -> None:
+        """Tint the artboard with the engine's region decision.
+
+        Green marks the traced outline row, blue the solid lattice fill and
+        amber the tonal scatter — the three treatments the Automatic mode
+        chooses between. Drawn over the stones (see the paint order in
+        :meth:`paintEvent`) so the outline band is not hidden by the very
+        stones that trace it, at a low enough opacity that the stones stay
+        readable underneath.
+        """
+        if not self._show_fill_areas or self._region_map is None:
+            return
+        if not bool(np.any(self._region_map)):
+            return
+        if self._region_pixmap is None:
+            region = self._region_map
+            rgba = np.zeros(region.shape + (4,), dtype=np.uint8)
+            pal = self._theme.palette
+            # (label, colour) — the colour identifies the treatment at a glance.
+            for label, hex_color in (
+                (REGION_OUTLINE, pal.success),
+                (REGION_SOLID, pal.primary),
+                (REGION_TONAL, pal.warning),
+            ):
+                sel = region == label
+                if not sel.any():
+                    continue
+                c = QColor(hex_color)
+                rgba[sel, 0] = c.red()
+                rgba[sel, 1] = c.green()
+                rgba[sel, 2] = c.blue()
+                rgba[sel, 3] = 255
+            self._region_pixmap = QPixmap.fromImage(numpy_rgba_to_qimage(rgba))
+        painter.save()
+        painter.setClipRect(art)
+        painter.setOpacity(0.45)
+        painter.drawPixmap(art.toRect(), self._region_pixmap)
+        painter.restore()
 
     # ------------------------------------------------------------------ #
     # Progressive generation streaming (ISSUE 5)
@@ -992,6 +1065,11 @@ class CanvasView(QWidget):
 
         self._paint_trace_overlay(painter, art)
         self._paint_stones(painter, art)
+        # Above the stones, deliberately: the outline band runs exactly where
+        # the outline row of stones sits, so drawn underneath it would be the
+        # one region this overlay exists to show. The overlay is an explicit,
+        # off-by-default analysis view, and it never affects the design.
+        self._paint_fill_areas(painter, art)
         self._paint_rubber_band(painter)
         self._paint_trace_cursor(painter)
         self._paint_ai_preview(painter)
